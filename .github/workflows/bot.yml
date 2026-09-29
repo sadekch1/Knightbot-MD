@@ -19,21 +19,8 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - uses: actions/cache/restore@v4
-        with:
-          path: session
-          key: session-${{ github.run_id }}
-          restore-keys: session-
-      - name: Seed session
-        run: |
-          mkdir -p session
-          [ -f session/creds.json ] || echo "${{ secrets.SESSION_B64 }}" | base64 -d > session/creds.json
       - name: Run bot
         run: timeout $((18000 + RANDOM % 2400)) node index.js || true
-      - uses: actions/cache/save@v4
-        with:
-          path: session
-          key: session-${{ github.run_id }}
       - run: sleep $((RANDOM % 240))
       - name: Restart
         env:
