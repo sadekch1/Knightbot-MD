@@ -1,0 +1,36 @@
+name: KnightBot Actions Runner
+
+on:
+  push:
+    branches: [ main, master ]
+  schedule:
+    - cron: '18 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  start-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg webp
+          npm install
+
+      - name: Start KnightBot
+        env:
+          SESSION_ID: ${{ secrets.SESSION_ID }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MODE: ${{ secrets.MODE }}
+          PREFIX: ${{ secrets.PREFIX }}
+        run: |
+          timeout 17100s npm start || true
