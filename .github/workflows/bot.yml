@@ -1,35 +1,41 @@
-name: KnightBot Actions Runner
-
+name: Bot
 on:
-  push:
-    branches: [ main, master ]
-  schedule:
-    - cron: '18 */5 * * *'
   workflow_dispatch:
 
+permissions:
+  actions: write
+
+concurrency:
+  group: bot
+  cancel-in-progress: false
+
 jobs:
-  start-bot:
+  run:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 355
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js Environment
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-
-      - name: Install Dependencies
+          node-version: 20
+      - run: npm install
+      - uses: actions/cache/restore@v4
+        with:
+          path: session
+          key: session-${{ github.run_id }}
+          restore-keys: session-
+      - name: Seed session
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg webp
-          npm install
-
-      - name: Check Session File
-        run: |
-          ls -la session/
-
-      - name: Start KnightBot
-        run: |
-          timeout 17100s npm start || true
+          mkdir -p session
+          [ -f session/creds.json ] || echo "${{ secrets.SESSION_B64 }}" | base64 -d > session/creds.json
+      - name: Run bot
+        run: timeout $((18000 + RANDOM % 2400)) node index.js || true
+      - uses: actions/cache/save@v4
+        with:
+          path: session
+          key: session-${{ github.run_id }}
+      - run: sleep $((RANDOM % 240))
+      - name: Restart
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo ${{ github.repository }}
