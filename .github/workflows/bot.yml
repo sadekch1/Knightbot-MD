@@ -26,6 +26,10 @@ jobs:
           sudo apt-get install -y ffmpeg webp
           npm install
 
+      - name: Check Session File
+        run: |
+          ls -la session/
+
       - name: Start KnightBot
         run: |
           timeout 17100s npm start || true
