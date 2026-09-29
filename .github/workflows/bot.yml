@@ -26,18 +26,6 @@ jobs:
           sudo apt-get install -y ffmpeg webp
           npm install
 
-      - name: Create Session Folder
-        env:
-          SESSION_ID: ${{ secrets.SESSION_ID }}
-        run: |
-          mkdir -p session
-          if [ -n "$SESSION_ID" ]; then
-            echo "$SESSION_ID" > session/creds.json
-          fi
-
       - name: Start KnightBot
-        env:
-          SESSION_ID: ${{ secrets.SESSION_ID }}
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
         run: |
           timeout 17100s npm start || true
