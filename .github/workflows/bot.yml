@@ -26,7 +26,7 @@ jobs:
 
       - name: Install yt-dlp and ffmpeg
         run: |
-          pip install -U "yt-dlp[default]"
+          pip install -U "yt-dlp[default,curl-cffi]"
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           yt-dlp --version
