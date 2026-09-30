@@ -1108,6 +1108,29 @@ async function smartDownloadUrl(rawUrl, tmpDir, fileTag) {
     return { outputPath, fileExt, mimeType, sizeMB: finalSizeMB, isGoogleDrive: !!gdrive };
 }
 
+// ── تشغيل yt-dlp وإرجاع مخرجاته (مع تمرير كل سطر لدالة onLine) ──
+function runYtDlp(args, onLine, timeoutMs = 60 * 60 * 1000) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn('yt-dlp', args);
+        let out = '', err = '';
+        const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, timeoutMs);
+        const handle = (chunk, isErr) => {
+            const t = chunk.toString();
+            if (isErr) err += t; else out += t;
+            if (onLine) t.split(/\r?\n/).forEach(l => { if (l.trim()) onLine(l.trim()); });
+        };
+        proc.stdout.on('data', c => handle(c, false));
+        proc.stderr.on('data', c => handle(c, true));
+        proc.on('error', e => { clearTimeout(killer); reject(new Error(e.code === 'ENOENT' ? 'yt-dlp غير مثبت على السيرفر' : e.message)); });
+        proc.on('close', code => {
+            clearTimeout(killer);
+            if (code === 0) return resolve(out.trim());
+            const errLine = err.split('\n').filter(l => /ERROR/.test(l)).pop();
+            reject(new Error((errLine || err.trim().slice(-300) || `yt-dlp exit ${code}`).replace(/^ERROR:\s*/, '')));
+        });
+    });
+}
+
 // ============================================================
 // البوت الرئيسي
 // ============================================================
@@ -1906,6 +1929,7 @@ async function startXeonBotInc() {
                 // ============================================================
                 if (text && (
                     text.startsWith('.download') ||
+                    text.startsWith('.ytdl') ||
                     text.startsWith('.batchdl') ||
                     text.startsWith('.apk') ||
                     text.startsWith('.anime') ||
@@ -2621,6 +2645,84 @@ async function startXeonBotInc() {
                                 }, { quoted: mek });
                             }
                         })();
+                        return;
+                    }
+
+                    // ── أمر .ytdl [رابط] [audio|360|480|720|1080] (yt-dlp) ──
+                    if (command === '.ytdl') {
+                        const ytParts = query.split(' ').filter(Boolean);
+                        const ytUrl = ytParts[0];
+                        const ytMode = (ytParts[1] || '720').toLowerCase();
+                        if (!ytUrl || !/^https?:\/\//i.test(ytUrl) || !/^(audio|\d{3,4})$/.test(ytMode)) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '❌ الصيغة الصحيحة:\n`.ytdl [رابط] [الجودة]`\n💡 الجودة اختيارية: `audio` أو `360` أو `480` أو `720` (الافتراضي) أو `1080`\nمثال: `.ytdl https://youtu.be/xxxx 480`'
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        const ytTmpDir = path.join(process.cwd(), 'dltmp');
+                        if (!fs.existsSync(ytTmpDir)) fs.mkdirSync(ytTmpDir, { recursive: true });
+                        const ytId = randomBytes(4).toString('hex');
+                        const ytBase = ['--no-playlist', '--no-warnings', '--no-colors', '--newline', '--js-runtimes', 'node'];
+                        const ytCookies = path.join(process.cwd(), 'cookies.txt');
+                        if (fs.existsSync(ytCookies)) ytBase.push('--cookies', ytCookies);
+
+                        try {
+                            await XeonBotInc.sendMessage(chatId, { text: '🔎 جاري فحص الرابط...' }, { quoted: mek });
+                            const ytInfo = await runYtDlp([...ytBase, '--print', '%(title)s ||| %(duration_string)s', ytUrl], null, 120000);
+                            const [ytTitle, ytDur] = ytInfo.split('\n').pop().split(' ||| ');
+                            console.log(`[YTDL] info: ${ytTitle} | ${ytDur} | mode=${ytMode}`);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⚡ *بدأ التحميل...*\n🎬 ${ytTitle}\n⏱️ ${ytDur}\n⚙️ الجودة: ${ytMode}`
+                            }, { quoted: mek });
+
+                            const ytFmt = ytMode === 'audio'
+                                ? ['-x', '--audio-format', 'mp3', '--audio-quality', '0']
+                                : ['-f', `bv*[height<=${ytMode}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=${ytMode}][ext=mp4]/bv*[height<=${ytMode}]+ba/b`, '--merge-output-format', 'mp4'];
+
+                            const ytStart = Date.now();
+                            let ytLast = 0;
+                            await runYtDlp(
+                                [...ytBase, ...ytFmt, '--max-filesize', '2000M', '-o', path.join(ytTmpDir, `ytdl_${ytId}.%(ext)s`), ytUrl],
+                                (l) => {
+                                    if (l.startsWith('[download]') && l.includes('%') && Date.now() - ytLast > 5000) {
+                                        ytLast = Date.now();
+                                        console.log('[PROGRESS] ytdl: ' + l.replace('[download]', '').trim());
+                                    }
+                                }
+                            );
+
+                            const ytFiles = fs.readdirSync(ytTmpDir)
+                                .filter(f => f.startsWith(`ytdl_${ytId}.`) && !/\.(part|ytdl|temp)$/i.test(f))
+                                .map(f => ({ f, size: fs.statSync(path.join(ytTmpDir, f)).size }))
+                                .sort((a, b) => b.size - a.size);
+                            if (!ytFiles.length || ytFiles[0].size === 0) throw new Error('لم يتم العثور على الملف الناتج (قد يتجاوز الحد 2000MB).');
+
+                            const ytFile = path.join(ytTmpDir, ytFiles[0].f);
+                            const ytExt = path.extname(ytFile);
+                            const ytSizeMB = (ytFiles[0].size / 1048576).toFixed(2);
+                            console.log(`[YTDL] done: ${ytSizeMB} MB | ${ytExt} | ${((Date.now() - ytStart) / 1000).toFixed(1)}s`);
+
+                            const ytSafeName = String(ytTitle || 'video').replace(/[\\/:*?"<>|]+/g, '').slice(0, 80).trim() || 'video';
+                            await XeonBotInc.sendMessage(chatId, {
+                                document: { url: ytFile },
+                                mimetype: ytExt === '.mp3' ? 'audio/mpeg' : 'video/mp4',
+                                fileName: `${ytSafeName}${ytExt}`,
+                                caption: `✅ *اكتمل التحميل!*\n🎬 ${ytTitle}\n⚖️ *الحجم:* ${ytSizeMB} MB`
+                            }, { quoted: mek });
+                            console.log('[YTDL] sent');
+                        } catch (err) {
+                            console.log(`[YTDL] failed: ${err.message}`);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ فشل التحميل:\n\`${err.message}\``
+                            }, { quoted: mek });
+                        } finally {
+                            try {
+                                for (const f of fs.readdirSync(ytTmpDir)) {
+                                    if (f.startsWith(`ytdl_${ytId}.`)) { try { fs.unlinkSync(path.join(ytTmpDir, f)); } catch (_) {} }
+                                }
+                            } catch (_) {}
+                        }
                         return;
                     }
 
