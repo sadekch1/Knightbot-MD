@@ -2667,9 +2667,23 @@ async function startXeonBotInc() {
                         const ytCookies = path.join(process.cwd(), 'cookies.txt');
                         if (fs.existsSync(ytCookies)) ytBase.push('--cookies', ytCookies);
 
+                        let ytUsed = [];
+                        // عند خطأ 403 نعيد المحاولة تلقائياً بمحاكاة متصفح Chrome و Referer
+                        const ytTry = async (fn) => {
+                            try { ytUsed = []; return await fn([]); }
+                            catch (e) {
+                                if (!/403|Forbidden/i.test(e.message)) throw e;
+                                console.log('[YTDL] 403 -> retry with --impersonate chrome');
+                                let origin = '';
+                                try { origin = new URL(ytUrl).origin + '/'; } catch (_) {}
+                                ytUsed = ['--impersonate', 'chrome', ...(origin ? ['--referer', origin] : [])];
+                                return await fn(ytUsed);
+                            }
+                        };
+
                         try {
                             await XeonBotInc.sendMessage(chatId, { text: '🔎 جاري فحص الرابط...' }, { quoted: mek });
-                            const ytInfo = await runYtDlp([...ytBase, '--print', '%(title)s ||| %(duration_string)s', ytUrl], null, 120000);
+                            const ytInfo = await ytTry((ex) => runYtDlp([...ytBase, ...ex, '--print', '%(title)s ||| %(duration_string)s', ytUrl], null, 120000));
                             const [ytTitle, ytDur] = ytInfo.split('\n').pop().split(' ||| ');
                             console.log(`[YTDL] info: ${ytTitle} | ${ytDur} | mode=${ytMode}`);
                             await XeonBotInc.sendMessage(chatId, {
@@ -2683,7 +2697,7 @@ async function startXeonBotInc() {
                             const ytStart = Date.now();
                             let ytLast = 0;
                             await runYtDlp(
-                                [...ytBase, ...ytFmt, '--max-filesize', '2000M', '-o', path.join(ytTmpDir, `ytdl_${ytId}.%(ext)s`), ytUrl],
+                                [...ytBase, ...ytUsed, ...ytFmt, '--max-filesize', '2000M', '-o', path.join(ytTmpDir, `ytdl_${ytId}.%(ext)s`), ytUrl],
                                 (l) => {
                                     if (l.startsWith('[download]') && l.includes('%') && Date.now() - ytLast > 5000) {
                                         ytLast = Date.now();
