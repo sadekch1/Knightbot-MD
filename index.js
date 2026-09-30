@@ -561,7 +561,7 @@ setInterval(() => {
 // Memory monitoring
 setInterval(() => {
     const used = process.memoryUsage().rss / 1024 / 1024
-    if (used > 250) {
+    if (used > 1500) {
         console.log('⚠️ RAM too high (>250MB), restarting bot...')
         process.exit(1)
     }
@@ -573,6 +573,7 @@ let owner = JSON.parse(fs.readFileSync('./data/owner.json'))
 global.botname = "KNIGHT BOT"
 global.themeemoji = "•"
 const pairingCode = process.argv.includes("--pairing-code")
+const usePairing = pairingCode || !!process.env.GITHUB_ACTIONS
 const useMobile = process.argv.includes("--mobile")
 
 const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
@@ -1085,13 +1086,13 @@ async function startXeonBotInc() {
         const XeonBotInc = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            printQRInTerminal: !pairingCode,
+            printQRInTerminal: !usePairing,
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
             },
-            markOnlineOnConnect: true,
+            markOnlineOnConnect: false,
             generateHighQualityLinkPreview: true,
             syncFullHistory: false,
             getMessage: async (key) => {
@@ -1107,6 +1108,22 @@ async function startXeonBotInc() {
 
         XeonBotInc.ev.on('creds.update', saveCreds)
         store.bind(XeonBotInc.ev)
+
+        // ── طلب Pairing Code تلقائياً (لتشغيل GitHub Actions) ──
+        if (usePairing && !XeonBotInc.authState.creds.registered) {
+            global.__pairTries = (global.__pairTries || 0) + 1
+            if (global.__pairTries <= 3) {
+                let num = String(require('./settings').ownerNumber || (owner && owner[0]) || '').replace(/[^0-9]/g, '')
+                setTimeout(async () => {
+                    try {
+                        let code = await XeonBotInc.requestPairingCode(num)
+                        code = code?.match(/.{1,4}/g)?.join('-') || code
+                        console.log('Your Pairing Code : ' + code)
+                        console.log('Enter it now: WhatsApp > Linked Devices > Link with phone number')
+                    } catch (e) { console.error('Pairing code error:', e.message) }
+                }, 3000)
+            }
+        }
 
         // ============================================================
         // معالجة الرسائل
