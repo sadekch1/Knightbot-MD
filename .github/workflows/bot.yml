@@ -4,6 +4,7 @@ on:
 
 permissions:
   actions: write
+  contents: write
 
 concurrency:
   group: bot
@@ -15,14 +16,46 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
+
+      - name: Install
+        run: npm install
+
+      - name: Fix missing module
+        run: |
+          mkdir -p lib
+          [ -f lib/m3uplayer.js ] || cat > lib/m3uplayer.js <<'EOF'
+          module.exports = new Proxy(function () {}, {
+            get: (t, k) => (k === 'then' || typeof k === 'symbol' ? undefined : () => {}),
+            apply: () => {}
+          });
+          EOF
+
       - name: Run bot
         run: timeout $((18000 + RANDOM % 2400)) node index.js || true
-      - run: sleep $((RANDOM % 240))
+
+      - name: Save session
+        if: always()
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -f session data
+          git commit -m "update session" || true
+          git pull --rebase || true
+          git push || true
+
+      - name: Random delay
+        run: sleep $((RANDOM % 240))
+
       - name: Restart
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run bot.yml --repo ${{ github.repository }}
+        run: |
+          if grep -q '"registered":true' session/creds.json 2>/dev/null; then
+            gh workflow run bot.yml --repo ${{ github.repository }}
+          else
+            echo "Session not registered - stopping."
+          fi
