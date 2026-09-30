@@ -933,14 +933,25 @@ async function resolveDirectUrl(url, headers) {
 }
 
 // ── عرض تقدم التحميل في السجل (كل 5 ثوانٍ) ──
+function progressBar(pct, width = 20) {
+    const p = Math.max(0, Math.min(100, pct));
+    const filled = Math.round(p / 100 * width);
+    return '[' + '#'.repeat(filled) + '-'.repeat(width - filled) + ']';
+}
 function makeProgress(label, total) {
     const t = { label, total: total || 0, bytes: 0, start: Date.now(), timer: null };
     t.timer = setInterval(() => {
         const mb = t.bytes / 1048576;
         const sec = Math.max((Date.now() - t.start) / 1000, 0.1);
-        const pct = t.total ? ` (${(t.bytes / t.total * 100).toFixed(1)}%)` : '';
-        const tot = t.total ? ` / ${(t.total / 1048576).toFixed(1)} MB` : '';
-        console.log(`[PROGRESS] ${t.label}: ${mb.toFixed(1)} MB${tot}${pct} | ${(mb / sec).toFixed(2)} MB/s | ${sec.toFixed(0)}s`);
+        const speed = mb / sec;
+        if (t.total) {
+            const pct = t.bytes / t.total * 100;
+            const remain = Math.max(t.total / 1048576 - mb, 0);
+            const eta = speed > 0 ? Math.round(remain / speed) : 0;
+            console.log(`[PROGRESS] ${t.label}\n   ${progressBar(pct)} ${pct.toFixed(1)}% | ${mb.toFixed(1)}/${(t.total / 1048576).toFixed(1)} MB | ${speed.toFixed(2)} MB/s | ETA ${eta}s`);
+        } else {
+            console.log(`[PROGRESS] ${t.label}\n   ${mb.toFixed(1)} MB | ${speed.toFixed(2)} MB/s | ${sec.toFixed(0)}s`);
+        }
     }, 5000);
     t.add = (n) => { t.bytes += n; };
     t.stop = () => clearInterval(t.timer);
@@ -2701,7 +2712,9 @@ async function startXeonBotInc() {
                                 (l) => {
                                     if (l.startsWith('[download]') && l.includes('%') && Date.now() - ytLast > 5000) {
                                         ytLast = Date.now();
-                                        console.log('[PROGRESS] ytdl: ' + l.replace('[download]', '').trim());
+                                        const _m = l.match(/([\d.]+)%/);
+                                        const _bar = _m ? progressBar(parseFloat(_m[1])) + ' ' : '';
+                                        console.log(`[PROGRESS] ytdl ${ytTitle}\n   ${_bar}${l.replace('[download]', '').trim()}`);
                                     }
                                 }
                             );
