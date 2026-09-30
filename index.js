@@ -1143,6 +1143,13 @@ async function startXeonBotInc() {
                 else if (mek.message?.[msgType]?.caption) text = mek.message[msgType].caption;
 
                 const chatId = mek.key.remoteJid;
+                // ── سجل الأوامر (يظهر في Actions) ──
+                if (text && text.trim().startsWith('.')) {
+                    const _who = String(mek.key.participant || chatId || '').split('@')[0];
+                    const _masked = _who.length > 4 ? '***' + _who.slice(-4) : _who;
+                    const _where = String(chatId).endsWith('@g.us') ? 'group' : 'private';
+                    console.log(`[CMD] ${new Date().toISOString()} | ${_where} | from:${mek.key.fromMe ? 'me' : _masked} | ${text.trim().slice(0, 200)}`);
+                }
                 const isReply = msgType === 'extendedTextMessage' &&
                     mek.message.extendedTextMessage.contextInfo?.quotedMessage;
 
@@ -1165,7 +1172,7 @@ async function startXeonBotInc() {
                         const qName = cached.names[idx];
                         qualityCache.delete(quotedId);
 
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         // ── تحميل نطاق حلقات أنمي (عدة حلقات بنفس الجودة) ──
@@ -1342,7 +1349,7 @@ async function startXeonBotInc() {
                             text: `⬇️ *جاري تحميل الفيديو...*\n📺 الجودة: ${qLabel}`
                         }, { quoted: mek });
 
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
                         const tmpPath = path.join(tmpDir, `okru_${randomBytes(4).toString('hex')}.mp4`);
 
@@ -1536,7 +1543,7 @@ async function startXeonBotInc() {
                                 return;
                             }
 
-                            const tmpDir = path.join(process.cwd(), 'tmp');
+                            const tmpDir = path.join(process.cwd(), 'dltmp');
                             if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                             const mangaNameClean = cached.mangaName.replace(/[^\w\s-]/g, '').trim();
@@ -1944,7 +1951,7 @@ async function startXeonBotInc() {
                             return;
                         }
 
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         // لا ننتظر (fire-and-forget) — تماماً مثل .record — حتى لا يتوقف معالج الرسائل
@@ -2275,7 +2282,7 @@ async function startXeonBotInc() {
                             return;
                         }
 
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         if (activeRecordings.has(chatId)) {
@@ -2448,7 +2455,7 @@ async function startXeonBotInc() {
                             return;
                         }
 
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         if (activeIptvRecordings.has(chatId)) {
@@ -2589,7 +2596,7 @@ async function startXeonBotInc() {
                             return;
                         }
 
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         let result;
@@ -2598,7 +2605,11 @@ async function startXeonBotInc() {
                                 text: `⚡ *بدأ التحميل...*`
                             }, { quoted: mek });
 
-                            result = await smartDownloadUrl(query.split(' ')[0], tmpDir, 'File');
+                            const _dlUrl = query.split(' ')[0];
+                            const _dlStart = Date.now();
+                            console.log(`[DOWNLOAD] start: ${_dlUrl}`);
+                            result = await smartDownloadUrl(_dlUrl, tmpDir, 'File');
+                            console.log(`[DOWNLOAD] done: ${result.sizeMB} MB | ${result.fileExt} | ${((Date.now() - _dlStart) / 1000).toFixed(1)}s`);
 
                             await XeonBotInc.sendMessage(chatId, {
                                 document: { url: result.outputPath },
@@ -2608,6 +2619,7 @@ async function startXeonBotInc() {
                             }, { quoted: mek });
 
                         } catch (err) {
+                            console.log(`[DOWNLOAD] failed: ${err.message}`);
                             await XeonBotInc.sendMessage(chatId, {
                                 text: `❌ فشل التحميل:\n\`${err.message}\`\n\n💡 إذا كان الخطأ 503/502: السيرفر مزدحم أو مطفأ مؤقتاً — جرّب بعد قليل أو تأكد أن الرابط يعمل في المتصفح.`
                             }, { quoted: mek });
@@ -2688,6 +2700,7 @@ async function startXeonBotInc() {
                                 text: `🚀 *جاري تشغيل التحميل عن بُعد على GitHub Actions...*\n📦 حجم الجزء: ${chunkSizeMb} MB\n\n🛑 لإلغاء التحميل في أي وقت: \`.stopremotedl\``
                             }, { quoted: mek });
 
+                            console.log(`[REMOTEDL] start: ${fileUrl} | chunk:${chunkSizeMb}MB`);
                             dispatchTime = await triggerRemoteDownload(fileUrl, chunkSizeMb);
                             run = await findTriggeredRun(dispatchTime);
                             control.runId = run.id;
@@ -2729,7 +2742,7 @@ async function startXeonBotInc() {
                         }
 
                         // ── مرحلة تحميل وإرسال الأجزاء: مع إعادة محاولة تلقائية ودعم الإلغاء ──
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         const PART_MAX_RETRIES = 3;      // عدد محاولات تحميل كل جزء قبل اعتباره فشل نهائياً
@@ -2864,7 +2877,7 @@ async function startXeonBotInc() {
                                 text: `📦 *بدء التحميل المجمّع!*\n🔗 عدد الروابط: ${jobs.length}\n⏱️ فاصل ${BATCHDL_SLEEP_MS / 1000} ثوانٍ بين كل رابط\n🔁 حتى ${BATCHDL_MAX_RETRIES} محاولات لكل رابط عند الفشل\n⏳ سيتم إرسال كل ملف فور اكتمال تحميله...`
                             }, { quoted: mek });
 
-                            const tmpDir = path.join(process.cwd(), 'tmp');
+                            const tmpDir = path.join(process.cwd(), 'dltmp');
                             if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                             let successCount = 0, failCount = 0;
@@ -2986,7 +2999,7 @@ async function startXeonBotInc() {
                                 text: `📦 *تم العثور على:* ${appName}\n🆔 *الحزمة:* ${app.package}\n\nجاري تحميل ملف الـ APK...`
                             }, { quoted: mek });
 
-                            const tmpDir = path.join(process.cwd(), 'tmp');
+                            const tmpDir = path.join(process.cwd(), 'dltmp');
                             if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                             const cleanName = appName.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_');
@@ -3261,7 +3274,7 @@ async function startXeonBotInc() {
                             try { refererToUse = new URL(m3u8Url).origin + '/'; } catch (_) { refererToUse = null; }
                         }
                         const HLS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-                        const tmpDir = path.join(process.cwd(), 'tmp');
+                        const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
                         const fileId = randomBytes(4).toString('hex');
