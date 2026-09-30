@@ -932,7 +932,29 @@ async function resolveDirectUrl(url, headers) {
     return { finalUrl: res.request?.res?.responseUrl || url, headRes: res };
 }
 
-function downloadChunkToFile(url, start, end, destPath, headers) {
+// ── عرض تقدم التحميل في السجل (كل 5 ثوانٍ) ──
+function makeProgress(label, total) {
+    const t = { label, total: total || 0, bytes: 0, start: Date.now(), timer: null };
+    t.timer = setInterval(() => {
+        const mb = t.bytes / 1048576;
+        const sec = Math.max((Date.now() - t.start) / 1000, 0.1);
+        const pct = t.total ? ` (${(t.bytes / t.total * 100).toFixed(1)}%)` : '';
+        const tot = t.total ? ` / ${(t.total / 1048576).toFixed(1)} MB` : '';
+        console.log(`[PROGRESS] ${t.label}: ${mb.toFixed(1)} MB${tot}${pct} | ${(mb / sec).toFixed(2)} MB/s | ${sec.toFixed(0)}s`);
+    }, 5000);
+    t.add = (n) => { t.bytes += n; };
+    t.stop = () => clearInterval(t.timer);
+    return t;
+}
+function trackStream(stream, label, total) {
+    const t = makeProgress(label, parseInt(total) || 0);
+    stream.on('data', (c) => t.add(c.length));
+    const end = () => t.stop();
+    stream.on('end', end); stream.on('error', end); stream.on('close', end);
+    return t;
+}
+
+function downloadChunkToFile(url, start, end, destPath, headers, tracker) {
     return new Promise(async (resolve, reject) => {
         try {
             const res = await requestWithRetry({
@@ -943,6 +965,7 @@ function downloadChunkToFile(url, start, end, destPath, headers) {
             if (res.status >= 400) return reject(new Error(`فشل تحميل الجزء (HTTP ${res.status})`));
 
             const writer = fs.createWriteStream(destPath);
+            if (tracker) res.data.on('data', (c) => tracker.add(c.length));
             res.data.pipe(writer);
             res.data.on('error', reject);
             writer.on('finish', resolve);
@@ -970,7 +993,7 @@ function mergeChunkFiles(chunkPaths, outputPath) {
 }
 
 // تحميل بخيط واحد مع إعادة محاولة — يُستخدم كخطة بديلة عند فشل التحميل المتوازي
-async function singleStreamDownload(url, headers, outputPath) {
+async function singleStreamDownload(url, headers, outputPath, tracker) {
     const res = await requestWithRetry({
         method: 'GET', url, responseType: 'stream',
         timeout: 1800000, maxRedirects: 10, headers
@@ -979,6 +1002,7 @@ async function singleStreamDownload(url, headers, outputPath) {
     if (res.status >= 400) throw new Error(`فشل التحميل (HTTP ${res.status})`);
 
     const writer = fs.createWriteStream(outputPath);
+    if (tracker) res.data.on('data', (c) => tracker.add(c.length));
     res.data.pipe(writer);
     await new Promise((resolve, reject) => {
         res.data.on('error', reject);
@@ -1028,6 +1052,12 @@ async function smartDownloadUrl(rawUrl, tmpDir, fileTag) {
     const chunkPaths = [];
     const THREADS = 8;
 
+    let _dlName = (String(contentDisp).match(/filename\*?=(?:UTF-8'')?"?([^";]+)/i) || [])[1];
+    if (!_dlName) { try { _dlName = decodeURIComponent(path.basename(new URL(finalUrl).pathname)) || '?'; } catch (_) { _dlName = '?'; } }
+    const _parallel = !gdrive && acceptRanges && totalSize > 1024 * 1024;
+    console.log(`[DOWNLOAD] info: name=${_dlName} | type=${contentType || '?'} | size=${totalSize ? (totalSize / 1048576).toFixed(1) + ' MB' : 'unknown'} | mode=${gdrive ? 'gdrive' : (_parallel ? 'parallel x' + THREADS : 'single')}`);
+    const tracker = makeProgress(`${fileTag || 'DL'} ${_dlName}`.slice(0, 80), totalSize);
+
     const cleanupChunks = () => {
         for (const cp of chunkPaths) { try { if (fs.existsSync(cp)) fs.unlinkSync(cp); } catch (_) {} }
         chunkPaths.length = 0;
@@ -1044,7 +1074,7 @@ async function smartDownloadUrl(rawUrl, tmpDir, fileTag) {
                     const end = Math.min(start + chunkSize - 1, totalSize - 1);
                     const chunkPath = path.join(tmpDir, `chunk_${fileId}_${i}`);
                     chunkPaths.push(chunkPath);
-                    promises.push(downloadChunkToFile(finalUrl, start, end, chunkPath, headersToUse));
+                    promises.push(downloadChunkToFile(finalUrl, start, end, chunkPath, headersToUse, tracker));
                 }
                 await Promise.all(promises);
                 await mergeChunkFiles(chunkPaths, outputPath);
@@ -1052,13 +1082,17 @@ async function smartDownloadUrl(rawUrl, tmpDir, fileTag) {
                 // خطة بديلة: بعض السيرفرات تخنق الاتصالات المتوازية وترد 503
                 cleanupChunks();
                 try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
+                console.log('[DOWNLOAD] parallel failed, retrying single stream...');
+                tracker.bytes = 0; tracker.start = Date.now();
                 await sleepMs(3000);
-                await singleStreamDownload(finalUrl, headersToUse, outputPath);
+                await singleStreamDownload(finalUrl, headersToUse, outputPath, tracker);
             }
         } else {
-            await singleStreamDownload(finalUrl, headersToUse, outputPath);
+            await singleStreamDownload(finalUrl, headersToUse, outputPath, tracker);
         }
+        tracker.stop();
     } catch (err) {
+        tracker.stop();
         cleanupChunks();
         try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
         throw err;
@@ -1215,6 +1249,7 @@ async function startXeonBotInc() {
                                     });
 
                                     const writer = fs.createWriteStream(outPath);
+                                    trackStream(response.data, `${cached.slug} Ep${ep}`, response.headers['content-length']);
                                     response.data.pipe(writer);
 
                                     await new Promise((resolve, reject) => {
@@ -1276,6 +1311,7 @@ async function startXeonBotInc() {
 
                             const writer = fs.createWriteStream(outPath);
 
+                            trackStream(response.data, `${cached.title || 'video'} [${qName}]`, response.headers['content-length']);
                             response.data.pipe(writer);
 
                             await new Promise((resolve, reject) => {
@@ -1365,6 +1401,7 @@ async function startXeonBotInc() {
                             });
 
                             const writer = fs.createWriteStream(tmpPath);
+                            trackStream(videoRes.data, 'ok.ru video', videoRes.headers['content-length']);
                             videoRes.data.pipe(writer);
                             await new Promise((resolve, reject) => {
                                 writer.on('finish', resolve);
@@ -3010,6 +3047,7 @@ async function startXeonBotInc() {
                                 timeout: 600000, headers: { 'User-Agent': 'Mozilla/5.0' }
                             });
                             const writer = fs.createWriteStream(outputPath);
+                            trackStream(response.data, `APK ${cleanName}`, response.headers['content-length']);
                             response.data.pipe(writer);
                             await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
 
