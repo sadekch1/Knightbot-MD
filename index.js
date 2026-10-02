@@ -592,7 +592,7 @@ const AKWAM_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'ar,en;q=0.5',
-    'Referer': 'https://akwam.it/'
+    'Referer': 'https://akwam.ss/'
 };
 
 async function akwamFetch(url) {
@@ -606,7 +606,7 @@ async function akwamFetch(url) {
 
 function extractAkwamSeries(html) {
     const results = [];
-    const regex = /href="(https?:\/\/akwam\.it\/series\/[^"#?]+)"/g;
+    const regex = /href="(https?:\/\/akwam\.ss\/series\/[^"#?]+)"/g;
     let m;
     while ((m = regex.exec(html)) !== null) {
         const url = m[1].split('?')[0];
@@ -620,7 +620,7 @@ function extractAkwamSeries(html) {
 
 function extractAkwamEpisodes(html) {
     const results = [];
-    const regex = /href="(https?:\/\/akwam\.it\/episode\/[^"#?]+)"/g;
+    const regex = /href="(https?:\/\/akwam\.ss\/episode\/[^"#?]+)"/g;
     let m;
     while ((m = regex.exec(html)) !== null) {
         const url = m[1].split('?')[0];
@@ -631,7 +631,7 @@ function extractAkwamEpisodes(html) {
 
 async function extractAkwamMp4Links(epUrl) {
     const html = await akwamFetch(epUrl);
-    const watchMatch = html.match(/"(https?:\/\/akwam\.it\/watch[^"]+)"/);
+    const watchMatch = html.match(/"(https?:\/\/akwam\.ss\/watch[^"]+)"/);
     if (!watchMatch) return [];
     const watchHtml = await akwamFetch(watchMatch[1]);
     const mp4Links = [...new Set(
@@ -1358,7 +1358,7 @@ async function startXeonBotInc() {
                                 timeout: 1800000,
                                 headers: {
                                     'User-Agent': 'Mozilla/5.0',
-                                    'Referer': cached.referer || 'https://akwam.it/'
+                                    'Referer': cached.referer || 'https://akwam.ss/'
                                 }
                             });
 
@@ -1846,7 +1846,7 @@ async function startXeonBotInc() {
                                     links: mp4Links,
                                     names,
                                     title: seriesName,
-                                    referer: 'https://akwam.it/',
+                                    referer: 'https://akwam.ss/',
                                     timestamp: Date.now()
                                 });
                                 setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
@@ -3528,7 +3528,7 @@ async function startXeonBotInc() {
                         return;
                     }
 
-                    // ── أمر .series (akwam.it) ──
+                    // ── أمر .series (akwam.ss) ──
                     if (command === '.series') {
                         if (!query) {
                             await XeonBotInc.sendMessage(chatId, {
@@ -3538,15 +3538,15 @@ async function startXeonBotInc() {
                         }
                         try {
                             await XeonBotInc.sendMessage(chatId, {
-                                text: `🔍 جاري البحث عن *${query}* في akwam.it...`
+                                text: `🔍 جاري البحث عن *${query}* في akwam.ss...`
                             }, { quoted: mek });
 
-                            const html = await akwamFetch(`https://akwam.it/search?q=${encodeURIComponent(query)}`);
+                            const html = await akwamFetch(`https://akwam.ss/search?q=${encodeURIComponent(query)}`);
                             const results = extractAkwamSeries(html);
 
                             if (results.length === 0) throw new Error('لم يتم العثور على مسلسلات مطابقة. جرّب اسماً مختلفاً.');
 
-                            let resText = `📺 *نتائج البحث في akwam.it:*\n\n`;
+                            let resText = `📺 *نتائج البحث في akwam.ss:*\n\n`;
                             results.slice(0, 12).forEach((s, i) => {
                                 resText += `*${i + 1}* - ${s.name}\n`;
                             });
