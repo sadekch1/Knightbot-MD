@@ -1120,9 +1120,28 @@ async function smartDownloadUrl(rawUrl, tmpDir, fileTag) {
 }
 
 // ── تشغيل yt-dlp وإرجاع مخرجاته (مع تمرير كل سطر لدالة onLine) ──
-function runYtDlp(args, onLine, timeoutMs = 60 * 60 * 1000) {
+const ytPending = new Map(); // طلبات .ytdl بانتظار التأكيد
+const ytActive = new Map();  // تحميلات ytdl الجارية
+function fmtBytes(n) {
+    if (!n) return 'غير معروف';
+    return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : (n / 1048576).toFixed(1) + ' MB';
+}
+function runFfmpeg(args, onLine, holder = null, timeoutMs = 5 * 60 * 60 * 1000) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn('ffmpeg', args);
+        if (holder) holder.proc = proc;
+        let err = '';
+        const killer = setTimeout(() => { try { proc.kill('SIGINT'); } catch (_) {} }, timeoutMs);
+        proc.stdout.on('data', c => { if (onLine) c.toString().split(/\r?\n/).forEach(l => { if (l.trim()) onLine(l.trim()); }); });
+        proc.stderr.on('data', c => { err += c.toString(); });
+        proc.on('error', e => { clearTimeout(killer); reject(new Error(e.code === 'ENOENT' ? 'ffmpeg غير مثبت على السيرفر' : e.message)); });
+        proc.on('close', code => { clearTimeout(killer); resolve({ code, err: err.trim() }); });
+    });
+}
+function runYtDlp(args, onLine, timeoutMs = 60 * 60 * 1000, holder = null) {
     return new Promise((resolve, reject) => {
         const proc = spawn('yt-dlp', args);
+        if (holder) holder.proc = proc;
         let out = '', err = '';
         const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, timeoutMs);
         const handle = (chunk, isErr) => {
@@ -1941,6 +1960,10 @@ async function startXeonBotInc() {
                 if (text && (
                     text.startsWith('.download') ||
                     text.startsWith('.ytdl') ||
+                    text.startsWith('.ytlive') ||
+                    text.startsWith('.ytgo') ||
+                    text.startsWith('.ytno') ||
+                    text.startsWith('.stopytdl') ||
                     text.startsWith('.batchdl') ||
                     text.startsWith('.apk') ||
                     text.startsWith('.anime') ||
@@ -2659,15 +2682,225 @@ async function startXeonBotInc() {
                         return;
                     }
 
-                    // ── أمر .ytdl [رابط] [audio|360|480|720|1080] (yt-dlp) ──
+                    // ── أمر .ytlive [رابط] [الدقائق] [الجودة] [-y] : تسجيل بث مباشر لمدة محددة ──
+                    if (command === '.ytlive') {
+                        const lp = query.split(' ').filter(Boolean);
+                        const lSkip = lp.includes('-y');
+                        const la = lp.filter(x => x !== '-y');
+                        const lUrl = la[0];
+                        const lMin = parseInt(la[1]);
+                        const lMode = (la[2] || '720').toLowerCase();
+                        if (!lUrl || !/^https?:\/\//i.test(lUrl) || !lMin || lMin < 1 || lMin > 240 || !/^(audio|\d{3,4})$/.test(lMode)) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '❌ الصيغة الصحيحة:\n`.ytlive [رابط البث] [عدد الدقائق] [الجودة]`\n💡 الدقائق من 1 إلى 240. الجودة اختيارية: `audio` أو `360` أو `480` أو `720` (الافتراضي) أو `1080`\nأضف `-y` لتخطي سؤال التأكيد.\nمثال: `.ytlive https://youtube.com/watch?v=xxxx 30 480`\n⏹️ لإيقاف التسجيل وإرسال ما سُجّل: `.stopytdl`'
+                            }, { quoted: mek });
+                            return;
+                        }
+                        if (ytActive.has(chatId)) {
+                            await XeonBotInc.sendMessage(chatId, { text: '⏳ يوجد تحميل أو تسجيل جارٍ بالفعل. استخدم `.stopytdl`.' }, { quoted: mek });
+                            return;
+                        }
+
+                        const lTmpDir = path.join(process.cwd(), 'dltmp');
+                        if (!fs.existsSync(lTmpDir)) fs.mkdirSync(lTmpDir, { recursive: true });
+                        const lId = randomBytes(4).toString('hex');
+                        const lBase = ['--no-playlist', '--no-warnings', '--no-colors', '--newline', '--js-runtimes', 'node'];
+                        const lCookies = path.join(process.cwd(), 'cookies.txt');
+                        if (fs.existsSync(lCookies)) lBase.push('--cookies', lCookies);
+                        const lFmt = lMode === 'audio'
+                            ? ['-f', 'ba/b']
+                            : ['-f', `b[height<=${lMode}]/bv*[height<=${lMode}]+ba/b`];
+
+                        let lUsed = [];
+                        const lTry = async (fn) => {
+                            try { lUsed = []; return await fn([]); }
+                            catch (e) {
+                                if (!/403|Forbidden/i.test(e.message)) throw e;
+                                console.log('[YTLIVE] 403 -> retry with --impersonate chrome');
+                                let origin = '';
+                                try { origin = new URL(lUrl).origin + '/'; } catch (_) {}
+                                lUsed = ['--impersonate', 'chrome', ...(origin ? ['--referer', origin] : [])];
+                                return await fn(lUsed);
+                            }
+                        };
+
+                        let lTitle = 'live';
+                        const lRunJob = async () => {
+                            const state = { holder: {}, cancelled: false, early: false, kind: 'live' };
+                            ytActive.set(chatId, state);
+                            try {
+                                await XeonBotInc.sendMessage(chatId, { text: `🔴 *بدأ تسجيل البث لمدة ${lMin} دقيقة...*\n🎬 ${lTitle}\n⏹️ للإيقاف المبكر وإرسال ما سُجّل: \`.stopytdl\`` }, { quoted: mek });
+
+                                const urlsRaw = await runYtDlp([...lBase, ...lUsed, ...lFmt, '-g', lUrl], null, 120000, state.holder);
+                                const urls = urlsRaw.split('\n').map(x => x.trim()).filter(x => /^https?:\/\//i.test(x));
+                                if (!urls.length) throw new Error('تعذر الحصول على رابط البث.');
+                                if (state.early) throw new Error('تم الإيقاف قبل بدء التسجيل.');
+
+                                const recExt = lMode === 'audio' ? 'mp3' : 'ts';
+                                const recPath = path.join(lTmpDir, `ytlive_${lId}.${recExt}`);
+                                const inArgs = urls.flatMap(u => ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', u]);
+                                const outArgs = lMode === 'audio'
+                                    ? ['-vn', '-c:a', 'libmp3lame', '-q:a', '2']
+                                    : [...(urls.length > 1 ? ['-map', '0:v:0', '-map', '1:a:0'] : ['-map', '0:v:0?', '-map', '0:a:0?']), '-c', 'copy', '-f', 'mpegts'];
+
+                                const totalUs = lMin * 60 * 1e6;
+                                let lastOutUs = 0, lastSize = 0, lastLog = 0;
+                                const startedAt = Date.now();
+                                console.log(`[YTLIVE] recording ${lMin} min | ${lTitle}`);
+                                const rec = await runFfmpeg(
+                                    ['-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats', ...inArgs, '-t', String(lMin * 60), '-fs', '1950000000', ...outArgs, recPath],
+                                    (l) => {
+                                        const kv = l.split('=');
+                                        if (kv[0] === 'out_time_us' || kv[0] === 'out_time_ms') lastOutUs = parseInt(kv[1]) || lastOutUs;
+                                        else if (kv[0] === 'total_size') lastSize = parseInt(kv[1]) || lastSize;
+                                        if (Date.now() - lastLog > 5000 && lastOutUs > 0) {
+                                            lastLog = Date.now();
+                                            const pct = Math.min(lastOutUs / totalUs * 100, 100);
+                                            const rec_s = Math.round(lastOutUs / 1e6);
+                                            const speed = lastSize / 1048576 / Math.max((Date.now() - startedAt) / 1000, 1);
+                                            console.log(`[PROGRESS] live ${lTitle}\n   ${progressBar(pct)} ${pct.toFixed(1)}% | ${Math.floor(rec_s / 60)}:${String(rec_s % 60).padStart(2, '0')} / ${lMin}:00 | ${(lastSize / 1048576).toFixed(1)} MB | ${speed.toFixed(2)} MB/s`);
+                                        }
+                                    },
+                                    state.holder,
+                                    (lMin + 5) * 60 * 1000
+                                );
+
+                                if (!fs.existsSync(recPath) || fs.statSync(recPath).size === 0) {
+                                    throw new Error(rec.err.split('\n').pop() || 'لم يتم تسجيل أي بيانات (قد يكون البث غير متاح).');
+                                }
+
+                                let finalPath = recPath, mime = lMode === 'audio' ? 'audio/mpeg' : 'video/mp2t', ext = `.${recExt}`;
+                                if (lMode !== 'audio') {
+                                    const mp4Path = path.join(lTmpDir, `ytlive_${lId}.mp4`);
+                                    const mx = await runFfmpeg(['-y', '-hide_banner', '-loglevel', 'error', '-i', recPath, '-c', 'copy', '-movflags', '+faststart', mp4Path], null, null, 10 * 60 * 1000);
+                                    if (mx.code === 0 && fs.existsSync(mp4Path) && fs.statSync(mp4Path).size > 0) {
+                                        finalPath = mp4Path; mime = 'video/mp4'; ext = '.mp4';
+                                    } else {
+                                        console.log(`[YTLIVE] remux failed, sending .ts: ${mx.err.split('\n').pop()}`);
+                                    }
+                                }
+
+                                const finSize = fs.statSync(finalPath).size;
+                                const finMB = (finSize / 1048576).toFixed(2);
+                                const recSec = Math.round(lastOutUs / 1e6);
+                                console.log(`[YTLIVE] done: ${finMB} MB | ${ext} | ${recSec}s recorded | ${((Date.now() - startedAt) / 1000).toFixed(0)}s elapsed`);
+                                if (finSize > 2000 * 1048576) throw new Error(`الملف (${finMB} MB) يتجاوز حد واتساب 2 جيجا.`);
+
+                                const lSafe = String(lTitle || 'live').replace(/[\\/:*?"<>|]+/g, '').slice(0, 80).trim() || 'live';
+                                await XeonBotInc.sendMessage(chatId, {
+                                    document: { url: finalPath },
+                                    mimetype: mime,
+                                    fileName: `${lSafe}${ext}`,
+                                    caption: `✅ *اكتمل تسجيل البث!*\n🎬 ${lTitle}\n⏱️ المدة المسجلة: ${Math.floor(recSec / 60)}:${String(recSec % 60).padStart(2, '0')}\n⚖️ *الحجم:* ${finMB} MB`
+                                }, { quoted: mek });
+                                console.log('[YTLIVE] sent');
+                            } catch (err) {
+                                console.log(`[YTLIVE] failed: ${err.message}`);
+                                await XeonBotInc.sendMessage(chatId, { text: `❌ فشل تسجيل البث:\n\`${err.message}\`` }, { quoted: mek });
+                            } finally {
+                                ytActive.delete(chatId);
+                                try {
+                                    for (const f of fs.readdirSync(lTmpDir)) {
+                                        if (f.startsWith(`ytlive_${lId}.`)) { try { fs.unlinkSync(path.join(lTmpDir, f)); } catch (_) {} }
+                                    }
+                                } catch (_) {}
+                            }
+                        };
+
+                        // ── فحص الرابط والتأكد أنه بث مباشر ──
+                        try {
+                            await XeonBotInc.sendMessage(chatId, { text: '🔎 جاري فحص البث...' }, { quoted: mek });
+                            const raw = await lTry((ex) => runYtDlp([...lBase, ...ex, ...lFmt, '--dump-single-json', lUrl], null, 120000));
+                            const j = JSON.parse(raw.slice(raw.indexOf('{')));
+                            lTitle = j.title || 'live';
+                            const fl = j.requested_formats || [j];
+                            const tbr = fl.reduce((a, f) => a + (f.tbr || 0), 0);
+                            const estBytes = tbr ? tbr * 1000 / 8 * lMin * 60 : 0;
+                            const res = j.resolution || (j.height ? `${j.width || '?'}x${j.height}` : (lMode === 'audio' ? 'صوت' : '?'));
+                            console.log(`[YTLIVE] info: ${lTitle} | live=${!!j.is_live} | ${res} | est ~${fmtBytes(estBytes)} for ${lMin}min`);
+
+                            if (!j.is_live) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `🎬 *${lTitle}*\n\n⚠️ هذا الرابط ليس بثاً مباشراً الآن (قد يكون انتهى أو لم يبدأ).\n💡 للفيديوهات العادية استخدم: \`.ytdl ${lUrl}\``
+                                }, { quoted: mek });
+                                return;
+                            }
+
+                            const infoText = `🔴 *${lTitle}*\n📐 الدقة: ${res} (${lMode})\n⏱️ مدة التسجيل: ${lMin} دقيقة\n⚖️ الحجم المتوقع${estBytes ? ' (تقريبي)' : ''}: *${fmtBytes(estBytes)}*${estBytes > 1950000000 ? '\n⚠️ قد يتوقف التسجيل عند ~1.9 جيجا (حد واتساب). اختر جودة أقل أو مدة أقصر.' : ''}`;
+
+                            if (lSkip) {
+                                await XeonBotInc.sendMessage(chatId, { text: infoText }, { quoted: mek });
+                                await lRunJob();
+                            } else {
+                                ytPending.set(chatId, { run: lRunJob, expires: Date.now() + 2 * 60 * 1000 });
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `${infoText}\n\n❓ هل تريد بدء التسجيل؟\n✅ للبدء: \`.ytgo\`\n🚫 للإلغاء: \`.ytno\`\n_(ينتهي الطلب بعد دقيقتين)_`
+                                }, { quoted: mek });
+                            }
+                        } catch (err) {
+                            console.log(`[YTLIVE] failed: ${err.message}`);
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل فحص البث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أوامر yt-dlp: .ytdl / .ytgo / .ytno / .stopytdl ──
+                    if (command === '.stopytdl') {
+                        const st = ytActive.get(chatId);
+                        if (!st) {
+                            await XeonBotInc.sendMessage(chatId, { text: 'ℹ️ لا يوجد تحميل ytdl نشط في هذه المحادثة.' }, { quoted: mek });
+                            return;
+                        }
+                        if (st.kind === 'live') {
+                            st.early = true;
+                            try { if (st.holder.proc) st.holder.proc.kill('SIGINT'); } catch (_) {}
+                            console.log('[YTLIVE] stop requested (will send what was recorded)');
+                            await XeonBotInc.sendMessage(chatId, { text: '⏹️ جاري إيقاف التسجيل وإرسال ما تم تسجيله...' }, { quoted: mek });
+                            return;
+                        }
+                        st.cancelled = true;
+                        try { if (st.holder.proc) st.holder.proc.kill('SIGKILL'); } catch (_) {}
+                        console.log('[YTDL] stopped by user');
+                        return;
+                    }
+
+                    if (command === '.ytno') {
+                        const had = ytPending.delete(chatId);
+                        await XeonBotInc.sendMessage(chatId, { text: had ? '🚫 تم إلغاء طلب التحميل.' : 'ℹ️ لا يوجد طلب معلّق.' }, { quoted: mek });
+                        return;
+                    }
+
+                    if (command === '.ytgo') {
+                        const pd = ytPending.get(chatId);
+                        if (!pd || Date.now() > pd.expires) {
+                            ytPending.delete(chatId);
+                            await XeonBotInc.sendMessage(chatId, { text: '⌛ لا يوجد طلب معلّق أو انتهت صلاحيته. أعد إرسال `.ytdl [رابط]`.' }, { quoted: mek });
+                            return;
+                        }
+                        if (ytActive.has(chatId)) {
+                            await XeonBotInc.sendMessage(chatId, { text: '⏳ يوجد تحميل جارٍ بالفعل. استخدم `.stopytdl` لإيقافه.' }, { quoted: mek });
+                            return;
+                        }
+                        ytPending.delete(chatId);
+                        await pd.run();
+                        return;
+                    }
+
+                    // ── أمر .ytdl [رابط] [audio|360|480|720|1080] [-y] ──
                     if (command === '.ytdl') {
                         const ytParts = query.split(' ').filter(Boolean);
-                        const ytUrl = ytParts[0];
-                        const ytMode = (ytParts[1] || '720').toLowerCase();
+                        const ytSkipConfirm = ytParts.includes('-y');
+                        const ytArgs = ytParts.filter(x => x !== '-y');
+                        const ytUrl = ytArgs[0];
+                        const ytMode = (ytArgs[1] || '720').toLowerCase();
                         if (!ytUrl || !/^https?:\/\//i.test(ytUrl) || !/^(audio|\d{3,4})$/.test(ytMode)) {
                             await XeonBotInc.sendMessage(chatId, {
-                                text: '❌ الصيغة الصحيحة:\n`.ytdl [رابط] [الجودة]`\n💡 الجودة اختيارية: `audio` أو `360` أو `480` أو `720` (الافتراضي) أو `1080`\nمثال: `.ytdl https://youtu.be/xxxx 480`'
+                                text: '❌ الصيغة الصحيحة:\n`.ytdl [رابط] [الجودة]`\n💡 الجودة اختيارية: `audio` أو `360` أو `480` أو `720` (الافتراضي) أو `1080`\nأضف `-y` لتخطي سؤال التأكيد.\nمثال: `.ytdl https://youtu.be/xxxx 480`\n⛔ لإيقاف تحميل جارٍ: `.stopytdl`'
                             }, { quoted: mek });
+                            return;
+                        }
+                        if (ytActive.has(chatId)) {
+                            await XeonBotInc.sendMessage(chatId, { text: '⏳ يوجد تحميل جارٍ بالفعل. استخدم `.stopytdl` لإيقافه.' }, { quoted: mek });
                             return;
                         }
 
@@ -2677,6 +2910,10 @@ async function startXeonBotInc() {
                         const ytBase = ['--no-playlist', '--no-warnings', '--no-colors', '--newline', '--js-runtimes', 'node'];
                         const ytCookies = path.join(process.cwd(), 'cookies.txt');
                         if (fs.existsSync(ytCookies)) ytBase.push('--cookies', ytCookies);
+
+                        const ytFmt = ytMode === 'audio'
+                            ? ['-x', '--audio-format', 'mp3', '--audio-quality', '0']
+                            : ['-f', `bv*[height<=${ytMode}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=${ytMode}][ext=mp4]/bv*[height<=${ytMode}]+ba/b`, '--merge-output-format', 'mp4'];
 
                         let ytUsed = [];
                         // عند خطأ 403 نعيد المحاولة تلقائياً بمحاكاة متصفح Chrome و Referer
@@ -2692,63 +2929,110 @@ async function startXeonBotInc() {
                             }
                         };
 
+                        let ytTitle = 'video';
+                        // ── تنفيذ التحميل الفعلي (بعد التأكيد) ──
+                        const ytRunJob = async () => {
+                            const state = { holder: {}, cancelled: false };
+                            ytActive.set(chatId, state);
+                            try {
+                                await XeonBotInc.sendMessage(chatId, { text: `⚡ *بدأ التحميل...*\n🎬 ${ytTitle}\n⛔ للإيقاف: \`.stopytdl\`` }, { quoted: mek });
+                                const ytStart = Date.now();
+                                let ytLast = 0;
+                                await runYtDlp(
+                                    [...ytBase, ...ytUsed, ...ytFmt, '-o', path.join(ytTmpDir, `ytdl_${ytId}.%(ext)s`), ytUrl],
+                                    (l) => {
+                                        if (l.startsWith('[download]') && l.includes('%') && Date.now() - ytLast > 5000) {
+                                            ytLast = Date.now();
+                                            const _m = l.match(/([\d.]+)%/);
+                                            const _bar = _m ? progressBar(parseFloat(_m[1])) + ' ' : '';
+                                            console.log(`[PROGRESS] ytdl ${ytTitle}\n   ${_bar}${l.replace('[download]', '').trim()}`);
+                                        }
+                                    },
+                                    60 * 60 * 1000,
+                                    state.holder
+                                );
+
+                                const ytFiles = fs.readdirSync(ytTmpDir)
+                                    .filter(f => f.startsWith(`ytdl_${ytId}.`) && !/\.(part|ytdl|temp)$/i.test(f))
+                                    .map(f => ({ f, size: fs.statSync(path.join(ytTmpDir, f)).size }))
+                                    .sort((a, b) => b.size - a.size);
+                                if (!ytFiles.length || ytFiles[0].size === 0) throw new Error('لم يتم العثور على الملف الناتج.');
+
+                                const ytFile = path.join(ytTmpDir, ytFiles[0].f);
+                                const ytExt = path.extname(ytFile);
+                                const ytSizeMB = (ytFiles[0].size / 1048576).toFixed(2);
+                                console.log(`[YTDL] done: ${ytSizeMB} MB | ${ytExt} | ${((Date.now() - ytStart) / 1000).toFixed(1)}s`);
+                                if (ytFiles[0].size > 2000 * 1048576) throw new Error(`الملف (${ytSizeMB} MB) يتجاوز حد واتساب 2 جيجا. جرّب جودة أقل.`);
+
+                                const ytSafeName = String(ytTitle || 'video').replace(/[\\/:*?"<>|]+/g, '').slice(0, 80).trim() || 'video';
+                                await XeonBotInc.sendMessage(chatId, {
+                                    document: { url: ytFile },
+                                    mimetype: ytExt === '.mp3' ? 'audio/mpeg' : 'video/mp4',
+                                    fileName: `${ytSafeName}${ytExt}`,
+                                    caption: `✅ *اكتمل التحميل!*\n🎬 ${ytTitle}\n⚖️ *الحجم:* ${ytSizeMB} MB`
+                                }, { quoted: mek });
+                                console.log('[YTDL] sent');
+                            } catch (err) {
+                                if (state.cancelled) {
+                                    await XeonBotInc.sendMessage(chatId, { text: '⛔ تم إيقاف التحميل.' }, { quoted: mek });
+                                } else {
+                                    console.log(`[YTDL] failed: ${err.message}`);
+                                    await XeonBotInc.sendMessage(chatId, { text: `❌ فشل التحميل:\n\`${err.message}\`` }, { quoted: mek });
+                                }
+                            } finally {
+                                ytActive.delete(chatId);
+                                try {
+                                    for (const f of fs.readdirSync(ytTmpDir)) {
+                                        if (f.startsWith(`ytdl_${ytId}.`)) { try { fs.unlinkSync(path.join(ytTmpDir, f)); } catch (_) {} }
+                                    }
+                                } catch (_) {}
+                            }
+                        };
+
+                        // ── فحص الرابط وعرض الحجم قبل التحميل ──
                         try {
                             await XeonBotInc.sendMessage(chatId, { text: '🔎 جاري فحص الرابط...' }, { quoted: mek });
-                            const ytInfo = await ytTry((ex) => runYtDlp([...ytBase, ...ex, '--print', '%(title)s ||| %(duration_string)s', ytUrl], null, 120000));
-                            const [ytTitle, ytDur] = ytInfo.split('\n').pop().split(' ||| ');
-                            console.log(`[YTDL] info: ${ytTitle} | ${ytDur} | mode=${ytMode}`);
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `⚡ *بدأ التحميل...*\n🎬 ${ytTitle}\n⏱️ ${ytDur}\n⚙️ الجودة: ${ytMode}`
-                            }, { quoted: mek });
+                            const raw = await ytTry((ex) => runYtDlp([...ytBase, ...ex, ...ytFmt, '--dump-single-json', ytUrl], null, 120000));
+                            const j = JSON.parse(raw.slice(raw.indexOf('{')));
+                            ytTitle = j.title || 'video';
+                            const fl = j.requested_formats || [j];
+                            let total = 0, approx = false;
+                            for (const f of fl) {
+                                const sz = f.filesize || f.filesize_approx;
+                                if (sz) { total += sz; if (!f.filesize) approx = true; } else approx = true;
+                            }
+                            if (!total) {
+                                const tbr = fl.reduce((a, f) => a + (f.tbr || 0), 0);
+                                if (tbr && j.duration) { total = tbr * 1000 / 8 * j.duration; approx = true; }
+                            }
+                            const res = j.resolution || (j.height ? `${j.width || '?'}x${j.height}` : (ytMode === 'audio' ? 'صوت' : '?'));
+                            console.log(`[YTDL] info: ${ytTitle} | ${j.duration_string || '?'} | ${res} | ~${fmtBytes(total)} | mode=${ytMode} | live=${!!j.is_live}`);
 
-                            const ytFmt = ytMode === 'audio'
-                                ? ['-x', '--audio-format', 'mp3', '--audio-quality', '0']
-                                : ['-f', `bv*[height<=${ytMode}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=${ytMode}][ext=mp4]/bv*[height<=${ytMode}]+ba/b`, '--merge-output-format', 'mp4'];
+                            const infoText = `🎬 *${ytTitle}*\n⏱️ المدة: ${j.duration_string || 'غير معروفة'}\n📐 الدقة: ${res} (${ytMode})\n⚖️ الحجم${approx ? ' التقريبي' : ''}: *${fmtBytes(total)}*`;
 
-                            const ytStart = Date.now();
-                            let ytLast = 0;
-                            await runYtDlp(
-                                [...ytBase, ...ytUsed, ...ytFmt, '--max-filesize', '2000M', '-o', path.join(ytTmpDir, `ytdl_${ytId}.%(ext)s`), ytUrl],
-                                (l) => {
-                                    if (l.startsWith('[download]') && l.includes('%') && Date.now() - ytLast > 5000) {
-                                        ytLast = Date.now();
-                                        const _m = l.match(/([\d.]+)%/);
-                                        const _bar = _m ? progressBar(parseFloat(_m[1])) + ' ' : '';
-                                        console.log(`[PROGRESS] ytdl ${ytTitle}\n   ${_bar}${l.replace('[download]', '').trim()}`);
-                                    }
-                                }
-                            );
+                            if (j.is_live) {
+                                await XeonBotInc.sendMessage(chatId, { text: `${infoText}\n\n🔴 هذا بث مباشر ولا يُحمّل بهذا الأمر.` }, { quoted: mek });
+                                return;
+                            }
+                            if (total > 2000 * 1048576) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `${infoText}\n\n⚠️ الحجم يتجاوز حد واتساب (2 جيجا) ولن يمكن إرساله.\n💡 جرّب جودة أقل مثل: \`.ytdl ${ytUrl} 480\` أو \`audio\``
+                                }, { quoted: mek });
+                                return;
+                            }
 
-                            const ytFiles = fs.readdirSync(ytTmpDir)
-                                .filter(f => f.startsWith(`ytdl_${ytId}.`) && !/\.(part|ytdl|temp)$/i.test(f))
-                                .map(f => ({ f, size: fs.statSync(path.join(ytTmpDir, f)).size }))
-                                .sort((a, b) => b.size - a.size);
-                            if (!ytFiles.length || ytFiles[0].size === 0) throw new Error('لم يتم العثور على الملف الناتج (قد يتجاوز الحد 2000MB).');
-
-                            const ytFile = path.join(ytTmpDir, ytFiles[0].f);
-                            const ytExt = path.extname(ytFile);
-                            const ytSizeMB = (ytFiles[0].size / 1048576).toFixed(2);
-                            console.log(`[YTDL] done: ${ytSizeMB} MB | ${ytExt} | ${((Date.now() - ytStart) / 1000).toFixed(1)}s`);
-
-                            const ytSafeName = String(ytTitle || 'video').replace(/[\\/:*?"<>|]+/g, '').slice(0, 80).trim() || 'video';
-                            await XeonBotInc.sendMessage(chatId, {
-                                document: { url: ytFile },
-                                mimetype: ytExt === '.mp3' ? 'audio/mpeg' : 'video/mp4',
-                                fileName: `${ytSafeName}${ytExt}`,
-                                caption: `✅ *اكتمل التحميل!*\n🎬 ${ytTitle}\n⚖️ *الحجم:* ${ytSizeMB} MB`
-                            }, { quoted: mek });
-                            console.log('[YTDL] sent');
+                            if (ytSkipConfirm) {
+                                await XeonBotInc.sendMessage(chatId, { text: infoText }, { quoted: mek });
+                                await ytRunJob();
+                            } else {
+                                ytPending.set(chatId, { run: ytRunJob, expires: Date.now() + 2 * 60 * 1000 });
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `${infoText}\n\n❓ هل تريد التحميل؟\n✅ للتحميل: \`.ytgo\`\n🚫 للإلغاء: \`.ytno\`\n_(ينتهي الطلب بعد دقيقتين)_`
+                                }, { quoted: mek });
+                            }
                         } catch (err) {
                             console.log(`[YTDL] failed: ${err.message}`);
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `❌ فشل التحميل:\n\`${err.message}\``
-                            }, { quoted: mek });
-                        } finally {
-                            try {
-                                for (const f of fs.readdirSync(ytTmpDir)) {
-                                    if (f.startsWith(`ytdl_${ytId}.`)) { try { fs.unlinkSync(path.join(ytTmpDir, f)); } catch (_) {} }
-                                }
-                            } catch (_) {}
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل فحص الرابط:\n\`${err.message}\`` }, { quoted: mek });
                         }
                         return;
                     }
