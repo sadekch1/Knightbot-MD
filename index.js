@@ -1122,6 +1122,13 @@ async function smartDownloadUrl(rawUrl, tmpDir, fileTag) {
 // ── تشغيل yt-dlp وإرجاع مخرجاته (مع تمرير كل سطر لدالة onLine) ──
 const ytPending = new Map(); // طلبات .ytdl بانتظار التأكيد
 const ytActive = new Map();  // تحميلات ytdl الجارية
+function fmtCount(n) {
+    if (!n && n !== 0) return null;
+    if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+    return String(n);
+}
 function fmtBytes(n) {
     if (!n) return 'غير معروف';
     return n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : (n / 1048576).toFixed(1) + ' MB';
@@ -3258,6 +3265,62 @@ async function startXeonBotInc() {
                         } catch (err) {
                             console.log(`[YTLIVE] failed: ${err.message}`);
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل فحص البث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .ytsearch [عدد النتائج] [كلمات البحث] : بحث في يوتيوب بدون تحميل ──
+                    if (command === '.ytsearch' || command === '.yts') {
+                        const sParts = query.split(' ').filter(Boolean);
+                        let sCount = 5;
+                        let sQueryWords = sParts;
+                        if (sParts[0] && /^\d+$/.test(sParts[0])) {
+                            sCount = Math.min(Math.max(parseInt(sParts[0]), 1), 15);
+                            sQueryWords = sParts.slice(1);
+                        }
+                        const sQuery = sQueryWords.join(' ').trim();
+                        if (!sQuery) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '❌ الصيغة الصحيحة:\n`.ytsearch [عدد النتائج] [كلمات البحث]`\n💡 عدد النتائج اختياري (1 إلى 15، الافتراضي 5).\nمثال: `.ytsearch 8 شرح البرمجة بايثون`'
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        await XeonBotInc.sendMessage(chatId, { text: `🔎 جاري البحث عن: *${sQuery}*...` }, { quoted: mek });
+                        try {
+                            const sBase = ['--no-warnings', '--no-colors', '--flat-playlist', '--js-runtimes', 'node'];
+                            const sCookies = path.join(process.cwd(), 'cookies.txt');
+                            if (fs.existsSync(sCookies)) sBase.push('--cookies', sCookies);
+                            const raw = await runYtDlp(
+                                [...sBase, '--dump-single-json', `ytsearch${sCount}:${sQuery}`],
+                                null, 60000
+                            );
+                            const data = JSON.parse(raw.slice(raw.indexOf('{')));
+                            const entries = (data.entries || []).filter(Boolean);
+                            if (!entries.length) {
+                                await XeonBotInc.sendMessage(chatId, { text: `😕 لا توجد نتائج لـ: *${sQuery}*` }, { quoted: mek });
+                                return;
+                            }
+
+                            const fmtDur = (secs) => {
+                                if (!secs && secs !== 0) return '؟';
+                                secs = Math.round(secs);
+                                const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+                                return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+                            };
+
+                            const lines = entries.map((e, i) => {
+                                const url = e.webpage_url || e.url || (e.id ? `https://youtube.com/watch?v=${e.id}` : '');
+                                const viewsFmt = fmtCount(e.view_count);
+                                const views = viewsFmt ? `👁️ ${viewsFmt}` : '';
+                                return `*${i + 1}.* ${e.title || 'بدون عنوان'}\n📺 ${e.channel || e.uploader || '؟'} | ⏱️ ${fmtDur(e.duration)}${views ? ' | ' + views : ''}\n🔗 ${url}`;
+                            });
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🔎 *نتائج البحث عن:* ${sQuery}\n\n${lines.join('\n\n')}\n\n💡 لتحميل أي نتيجة: \`.ytdl [الرابط]\` أو \`.ytlive [الرابط]\` إن كان بثاً مباشراً.`
+                            }, { quoted: mek });
+                        } catch (err) {
+                            console.log(`[YTSEARCH] failed: ${err.message}`);
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث:\n\`${err.message}\`` }, { quoted: mek });
                         }
                         return;
                     }
