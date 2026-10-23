@@ -2234,6 +2234,12 @@ async function startXeonBotInc() {
                     text.startsWith('.download') ||
                     text.startsWith('.ytdl') ||
                     text.startsWith('.ytlive') ||
+                    text.startsWith('.ytsearch') ||
+                    text.startsWith('.yts') ||
+                    text.startsWith('.$') ||
+                    text.startsWith('.sh') ||
+                    text.startsWith('.killcmd') ||
+                    text.startsWith('.cwd') ||
                     text.startsWith('.ytgo') ||
                     text.startsWith('.ytno') ||
                     text.startsWith('.stopytdl') ||
