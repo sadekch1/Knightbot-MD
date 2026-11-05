@@ -2207,14 +2207,16 @@ const mvCache = new Map();
 
 // ── تثبيت مصدر واحد لـ .movie / .series (عبر .setmv) ──
 let mvLockedSource = null; // null = البحث في كل المصادر
-const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola'];
+const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru'];
 const MV_SOURCE_NAMES = {
     akwam: { source: 'akwam', label: '📺 Akwam' },
     cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
     cloudday: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
     meowtv: { source: 'meowtv', label: '🐱 MeowTv' },
     cinemaplus: { source: 'cinemaplus', label: '🎬 CinemaPlus' },
-    viola: { source: 'viola', label: '🎭 VioLa' }
+    viola: { source: 'viola', label: '🎭 VioLa' },
+    egywatch: { source: 'egywatch', label: '📺 Egywatch' },
+    okru: { source: 'okru', label: '📺 ok.ru' }
 };
 
 // ---------- akwam: أفلام ومسلسلات ----------
@@ -2618,6 +2620,98 @@ async function violaEpisodeLinks(vid) {
 
 // ---------- حل روابط حلقة/فيلم من أي مصدر (أفلام ومسلسلات) ----------
 // ترجع {links: [{url, label, referer?}], subtitleUrl?: string}
+// ---------- Egywatch (gateway.egywatch.live — API بلا auth، مفتاح ثابت) ----------
+// بحث ← عرض المسلسل (المواسم) ← حلقات الموسم ← فيديوهات (Uqload شغال، Server Egy ميت)
+// ملحوظة: بلا ترجمة عربية في الستريم نفسه (الـ API يقول lang Arabic بلا ملف ترجمة فعلي)
+const EGYWATCH_BASES = ['https://gateway.egywatch.live/egywatchapp/public/api', 'https://rn62mwg.com/egywatchapp/public/api'];
+const EGYWATCH_CODE = 'p2lbgWkFrykA4QyUmpHihzmc5BNzIABq';
+const EGYWATCH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function egywatchGet(path) {
+    let lastErr;
+    for (const base of EGYWATCH_BASES) {
+        try {
+            const res = await axios.get(base + path, { headers: { 'User-Agent': EGYWATCH_UA }, timeout: 20000 });
+            return res.data;
+        } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('فشل الاتصال بـ Egywatch.');
+}
+
+async function egywatchSearch(query) {
+    const data = await egywatchGet(`/search/${encodeURIComponent(query)}/${EGYWATCH_CODE}`);
+    const list = (data && data.search) || [];
+    return list
+        .filter(x => /serie/i.test(String(x.type || '')))
+        .map(x => ({ id: String(x.id), title: x.name, type: 'series' }))
+        .slice(0, 5);
+}
+
+async function egywatchEpisodes(seriesId) {
+    const show = await egywatchGet(`/series/show/${seriesId}/${EGYWATCH_CODE}`);
+    const seasons = (show && show.seasons) || [];
+    if (!seasons.length) throw new Error('لا توجد مواسم.');
+    const lists = await Promise.allSettled(seasons.map(s => egywatchGet(`/series/season/${s.id}/${EGYWATCH_CODE}`)));
+    const eps = [];
+    seasons.forEach((s, i) => {
+        if (lists[i].status !== 'fulfilled') return;
+        const sNum = s.season_number || (i + 1);
+        for (const e of (lists[i].value.episodes || [])) {
+            eps.push({
+                id: `${seriesId}:${s.id}:${e.episode_number}`,
+                number: 0,
+                title: `الموسم ${sNum} — الحلقة ${e.episode_number}`,
+                season: sNum,
+                epNum: e.episode_number,
+                videos: e.videos || []
+            });
+        }
+    });
+    eps.sort((a, b) => (a.season - b.season) || (a.epNum - b.epNum));
+    eps.forEach((e, i) => { e.number = i + 1; });
+    return eps;
+}
+
+async function egywatchEpisodeLinks(ep) {
+    const videos = ep.videos || [];
+    const tryUq = async (url) => {
+        const m3u8 = await extractUqloadM3u8(url);
+        const plRes = await axios.get(m3u8, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://uqload.com/' }, timeout: 20000, responseType: 'text' });
+        const variants = parseM3u8Variants(String(plRes.data || ''), m3u8);
+        if (variants.length) {
+            const out = [];
+            const seen = new Set();
+            for (const v of variants) {
+                const label = `Egywatch — ${v.label} (Uqload)`;
+                if (seen.has(label)) continue;
+                seen.add(label);
+                out.push({ url: v.url, label, referer: 'https://uqload.com/' });
+            }
+            return out;
+        }
+        return [{ url: m3u8, label: 'Egywatch — HLS (Uqload)', referer: 'https://uqload.com/' }];
+    };
+    const uq = videos.find(v => /uqload/i.test(v.server || v.name || '') || /uqload/i.test(v.url || v.link || ''));
+    if (uq) {
+        try { return await tryUq(uq.url || uq.link); } catch (_) {}
+    }
+    for (const v of videos) {
+        const url = v.url || v.link || '';
+        if (/\.mp4(\?|$)/i.test(url)) return [{ url, label: `Egywatch — MP4 (${v.server || 'server'})`, referer: '' }];
+        if (/uqload/i.test(url)) {
+            try { return await tryUq(url); } catch (_) {}
+        }
+    }
+    throw new Error('لا توجد سيرفرات شغالة لهذه الحلقة.');
+}
+
+// ---------- ok.ru في .series (احتياطي — فيديوهات منفردة بلا مواسم) ----------
+// نتائج البحث فيديوهات (حلقات) مباشرة — الاختيار يذهب للجودات فوراً بلا قائمة حلقات
+async function okruVideoLinks(id) {
+    const { videos } = await extractOkruVideo(`https://ok.ru/video/${id}`);
+    return videos.map(v => ({ url: v.url, label: 'ok.ru — ' + (OKRU_QUALITY_LABELS[v.name] || v.name), referer: '' }));
+}
+
 async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
     if (source === 'akwam') {
         const mp4s = await extractAkwamMp4Links(ep.id);
@@ -2639,6 +2733,7 @@ async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
         return { links: await cinemaPlusEpisodeLinks(pageId, key) };
     }
     if (source === 'viola') return { links: await violaEpisodeLinks(ep.id) };
+    if (source === 'egywatch') return { links: await egywatchEpisodeLinks(ep) };
     return { links: [] };
 }
 
@@ -2654,6 +2749,7 @@ async function resolveMvMovieLinks(source, cdSource, id) {
     }
     if (source === 'cinemaplus') return { links: await cinemaPlusMovieLinks(id) };
     if (source === 'viola') return { links: await violaEpisodeLinks(id) };
+    if (source === 'okru') return { links: await okruVideoLinks(id) };
     return { links: [] };
 }
 
@@ -2669,6 +2765,14 @@ async function mvSearchOne(name, query, kind) {
     if (e.source === 'meowtv') return await meowSearch(query, kind);
     if (e.source === 'cinemaplus') return await cinemaPlusSearch(query);
     if (e.source === 'viola') return await violaSearch(query);
+    if (e.source === 'egywatch') {
+        if (kind !== 'series') return []; // أفلام Egywatch لم تُفحص — مسلسلات فقط
+        return await egywatchSearch(query);
+    }
+    if (e.source === 'okru') {
+        if (kind !== 'series') return []; // ok.ru في .series فقط (حلقات منفردة)
+        return await okruSearchRaw(query);
+    }
     return [];
 }
 
@@ -4535,6 +4639,10 @@ async function startXeonBotInc() {
                                     const eps = await violaEpisodes(selected.id);
                                     if (eps.length) await showEpisodes(eps);
                                     else await direct();
+                                } else if (selected.source === 'egywatch') {
+                                    await showEpisodes(await egywatchEpisodes(selected.id));
+                                } else if (selected.source === 'okru') {
+                                    await direct();
                                 } else {
                                     throw new Error('مصدر غير معروف.');
                                 }
@@ -6701,7 +6809,7 @@ async function startXeonBotInc() {
                         return;
                     }
 
-                    // ── أمر .movie / .series (بحث أفلام ومسلسلات عبر 5 مصادر) ──
+                    // ── أمر .movie / .series (بحث أفلام ومسلسلات — Egywatch + ok.ru للمسلسلات فقط) ──
                     if (command === '.movie' || command === '.series') {
                         const kind = command === '.movie' ? 'movie' : 'series';
                         const kindAr = kind === 'movie' ? 'الفيلم' : 'المسلسل';
@@ -6716,7 +6824,7 @@ async function startXeonBotInc() {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: locked
                                     ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
-                                    : `🔍 جاري البحث عن *${query}* في 5 مصادر...`
+                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 7 : 6} مصادر...`
                             }, { quoted: mek });
 
                             const results = [];
@@ -6734,23 +6842,27 @@ async function startXeonBotInc() {
                                 const list = await mvSearchOne(mvLockedSource, query, kind);
                                 addResults(locked.source, locked.cdSource, list, 10);
                             } else {
-                                // بحث متوازي في المصادر الخمسة — فشل مصدر لا يوقف الباقي
-                                const [akwam, cdCloud, meow, cplus, viola] = await Promise.allSettled([
+                                // بحث متوازي في المصادر — فشل مصدر لا يوقف الباقي
+                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru] = await Promise.allSettled([
                                     akwamSearch(query, kind),
                                     kind === 'series' ? cloudDaySearch(query, 'CimaCloud', '2') : Promise.resolve([]),
                                     meowSearch(query, kind),
                                     cinemaPlusSearch(query),
-                                    violaSearch(query)
+                                    violaSearch(query),
+                                    kind === 'series' ? egywatchSearch(query) : Promise.resolve([]),
+                                    kind === 'series' ? okruSearchRaw(query) : Promise.resolve([])
                                 ]);
                                 if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 3);
                                 if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
                                 if (meow.status === 'fulfilled') addResults('meowtv', null, meow.value, 3);
                                 if (cplus.status === 'fulfilled') addResults('cinemaplus', null, cplus.value, 2);
                                 if (viola.status === 'fulfilled') addResults('viola', null, viola.value, 2);
+                                if (egyw.status === 'fulfilled') addResults('egywatch', null, egyw.value, 2);
+                                if (okru.status === 'fulfilled') addResults('okru', null, okru.value.map(v => ({ id: v.id, title: v.title })), 2);
                             }
-                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : 'لم يتم العثور على أي نتائج في المصادر الخمسة. جرّب اسماً مختلفاً.');
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'السبعة' : 'الستة'}. جرّب اسماً مختلفاً.`);
 
-                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : '🎭 VioLa';
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : '📺 ok.ru';
                             let responseText = kind === 'movie' ? `🎬 *نتائج البحث (أفلام):*\n\n` : `📺 *نتائج البحث (مسلسلات):*\n\n`;
                             results.slice(0, 15).forEach((r, index) => {
                                 responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
@@ -6781,7 +6893,9 @@ async function startXeonBotInc() {
                                 { name: '☁️ CloudDay (CimaCloud)', fn: async () => { const r = await cloudDaySearch('breaking bad', 'CimaCloud', '2'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🐱 MeowTv', fn: async () => { const r = await meowSearch('breaking bad', 'series'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🎬 CinemaPlus', fn: async () => { const r = await cinemaPlusSearch('one piece'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
-                                { name: '🎭 VioLa', fn: async () => { const r = await violaSearch('breaking bad'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                                { name: '🎭 VioLa', fn: async () => { const r = await violaSearch('breaking bad'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 Egywatch', fn: async () => { const r = await egywatchSearch('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 ok.ru', fn: async () => { const r = await okruSearchRaw('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
                             ];
                             const settled = await Promise.allSettled(probes.map(async p => {
                                 const t = Date.now();
