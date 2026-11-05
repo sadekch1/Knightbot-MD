@@ -807,10 +807,25 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         }
         return;
     }
-    const response = await axios({
-        method: 'GET', url, responseType: 'stream', timeout: 1800000,
-        headers: { 'User-Agent': 'Mozilla/5.0', ...headers }
-    });
+    let response;
+    try {
+        response = await axios({
+            method: 'GET', url, responseType: 'stream', timeout: 1800000,
+            headers: { 'User-Agent': 'Mozilla/5.0', ...headers }
+        });
+    } catch (err) {
+        // بعض سيرفرات الفيديو شهادتها مكسورة (سلسلة ناقصة) — أعد المحاولة بدون التحقق من الشهادة
+        const msg = String((err && err.message) || '');
+        const code = (err && err.code) || '';
+        const isCertErr = /certificate|self signed|unable to get local issuer/i.test(msg)
+            || ['UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'CERT_UNTRUSTED'].includes(code);
+        if (!isCertErr) throw err;
+        response = await axios({
+            method: 'GET', url, responseType: 'stream', timeout: 1800000,
+            headers: { 'User-Agent': 'Mozilla/5.0', ...headers },
+            httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
+        });
+    }
     if (response.status >= 400) throw new Error(`HTTP ${response.status}`);
     const writer = fs.createWriteStream(outPath);
     response.data.pipe(writer);
