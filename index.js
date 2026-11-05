@@ -792,6 +792,46 @@ function isHlsUrl(url) {
 }
 
 // تحميل ذكي: روابط m3u8 تُحوَّل عبر ffmpeg إلى mp4، والروابط المباشرة تُحمَّل عادياً
+// تحميل HLS بتنزيل المقاطع مباشرة (axios) ثم دمجها — لبعض السيرفرات (مثل Carateen)
+// التي تسمّي المقاطع .jpg فيرفضها ffmpeg عند فتح الـ m3u8 مباشرة
+async function downloadHlsSegments(url, outPath, headers = {}) {
+    const hdrs = { 'User-Agent': 'Mozilla/5.0', ...(headers || {}) };
+    // سيرفرات المقاطع تتعثر أحياناً (502) — إعادة المحاولة لكل طلب
+    const getWithRetry = async (u, opts, tries = 3) => {
+        let lastErr;
+        for (let i = 0; i < tries; i++) {
+            try { return await axios.get(u, opts); }
+            catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 2000 * (i + 1))); }
+        }
+        throw lastErr;
+    };
+    let pl = await getWithRetry(url, { headers: hdrs, timeout: 30000, responseType: 'text' });
+    let text = String(pl.data || '');
+    if (/#EXT-X-STREAM-INF/.test(text)) {
+        const variants = parseM3u8Variants(text, url);
+        if (!variants.length) throw new Error('لا توجد جودات في قائمة m3u8.');
+        const best = variants[variants.length - 1];
+        pl = await getWithRetry(best.url, { headers: hdrs, timeout: 30000, responseType: 'text' });
+        text = String(pl.data || '');
+        url = best.url;
+    }
+    const segUrls = text.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+        .map(l => { try { return new URL(l, url).toString(); } catch (_) { return null; } })
+        .filter(Boolean);
+    if (!segUrls.length) throw new Error('لا توجد مقاطع في قائمة m3u8.');
+    const tmpTs = outPath + '.ts';
+    try { fs.unlinkSync(tmpTs); } catch (_) {}
+    for (const seg of segUrls) {
+        const r = await getWithRetry(seg, { headers: hdrs, timeout: 60000, responseType: 'arraybuffer' });
+        fs.appendFileSync(tmpTs, Buffer.from(r.data));
+    }
+    const res = await runFfmpeg(['-i', tmpTs, '-c', 'copy', '-y', outPath], null);
+    try { fs.unlinkSync(tmpTs); } catch (_) {}
+    if (res.code !== 0 || !fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+        throw new Error('فشل دمج مقاطع HLS.');
+    }
+}
+
 async function downloadVideoSmart(url, outPath, headers = {}) {
     if (isHlsUrl(url)) {
         const args = [];
@@ -801,8 +841,12 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         }
         args.push('-i', url, '-c', 'copy', '-y', outPath);
         const res = await runFfmpeg(args, null);
-        if (res.code !== 0 || !fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
-            try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+        if (res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return;
+        try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+        // بعض سيرفرات HLS (مثل Carateen) مقاطعها بامتداد .jpg فيرفضها ffmpeg —
+        // حمّل المقاطع مباشرة وادمجها بدلاً من ذلك
+        await downloadHlsSegments(url, outPath, headers);
+        if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
             throw new Error('فشل تحويل بث m3u8 عبر ffmpeg');
         }
         return;
@@ -1735,9 +1779,419 @@ async function resolveAnimeEpisodeLinks(source, cdSource, animeId, ep) {
     if (source === 'anime4up') return await anime4upEpisodeLinks(ep.id);
     if (source === 'animedar') return await animedarEpisodeLinks(ep.id);
     if (source === 'kartoney') return await kartoneyEpisodeLinks(ep.id);
+    if (source === 'cartoondub') return [{ url: ep.url || ep.id, label: 'CartoonDub — MP4', referer: '' }];
+    if (source === 'carateen') return await carateenEpisodeLinks(ep);
+    if (source === 'dimakids') return await dimaEpisodeLinks(ep);
+    if (source === 'animezid') return await animezidEpisodeLinks(ep);
     if (source === 'animerco') return await animercoEpisodeLinks(ep.id);
     if (source === 'hianime') return await hianimeEpisodeLinks(animeId, ep);
     return [];
+}
+
+
+// ============================================================
+// كرتون قديم مدبلج — 6 مصادر (CartoonDub + Carateen + Kartoney + ok.ru + DimaKids + AnimeZid)
+// نفس منطق .anime: بحث متوازي → قائمة مرقّمة → حلقات → جودات → تحميل
+// ============================================================
+const cartoonCache = new Map();
+
+// ── تثبيت مصدر واحد لـ .cartoon (عبر .setcartoon) ──
+let cartoonLockedSource = null; // null = البحث في كل المصادر
+const CARTOON_SOURCE_LIST = ['cartoondub', 'carateen', 'kartoney', 'okru', 'dimakids', 'animezid'];
+const CARTOON_SOURCE_NAMES = {
+    cartoondub: { source: 'cartoondub', label: '🎨 CartoonDub' },
+    carateen: { source: 'carateen', label: '📺 Carateen' },
+    kartoney: { source: 'kartoney', label: '🧒 Kartoney' },
+    okru: { source: 'okru', label: '📺 ok.ru' },
+    dimakids: { source: 'dimakids', label: '🎬 DimaKids' },
+    animezid: { source: 'animezid', label: '🌟 AnimeZid' }
+};
+
+// ---------- CartoonDub (e-droid cards API) ----------
+// الرئيسية idsec=38314274 ← مسلسل (حقل 11 = id القسم) ← أجزاء ← حلقات (رابط mp4 مباشر)
+const CARTOONDUB_API = 'https://srv11.e-droid.net/srv/obtener_cards.php';
+const CARTOONDUB_UA = 'Android Vinebre Software';
+const CARTOONDUB_HOME = '38314274';
+
+async function cartoonDubFetchCards(idsec) {
+    const res = await axios.get(CARTOONDUB_API, {
+        params: { idusu: '1234567890', ind_ini: 0, idsec },
+        headers: { 'User-Agent': CARTOONDUB_UA }, timeout: 20000, responseType: 'text'
+    });
+    return String(res.data || '').replace(/^ANDROID:OK DATOS:/, '');
+}
+
+function cartoonDubParseCards(raw) {
+    const out = [];
+    for (const card of String(raw || '').split(';')) {
+        const c = card.trim();
+        if (!c || c === 'N') continue;
+        const f = c.split(',');
+        const title = (f[5] || '').trim();
+        if (!title) continue;
+        const urlM = c.match(/https?:\/\/[^\s,;]+\.mp4/i);
+        if (urlM) {
+            out.push({ kind: 'episode', title, url: urlM[0] });
+            continue;
+        }
+        const sec = (f[11] || '').trim();
+        if (/^\d{7,}$/.test(sec)) out.push({ kind: 'section', title, sectionId: sec });
+    }
+    return out;
+}
+
+async function cartoonDubSearch(query) {
+    const cards = cartoonDubParseCards(await cartoonDubFetchCards(CARTOONDUB_HOME));
+    const q = normAr(query);
+    // كلمات من حرفين فأكثر (لازم "بن" في "بن تن" يطابق "بن 10")
+    const words = q.split(/\s+/).filter(w => w.length >= 2);
+    const hits = cards.filter(c => {
+        if (c.kind !== 'section') return false;
+        const t = normAr(c.title);
+        if (!t) return false;
+        if (t.includes(q)) return true;
+        return words.some(w => t.includes(w));
+    });
+    return hits.slice(0, 5).map(h => ({ id: h.sectionId, title: h.title }));
+}
+
+async function cartoonDubEpisodes(sectionId) {
+    const eps = [];
+    const walk = async (idsec, partLabel) => {
+        const cards = cartoonDubParseCards(await cartoonDubFetchCards(idsec));
+        for (const c of cards) {
+            if (c.kind === 'episode') {
+                eps.push({
+                    number: eps.length + 1,
+                    title: partLabel ? `${partLabel} — ${c.title}` : c.title,
+                    id: c.url, url: c.url
+                });
+            }
+        }
+        for (const c of cards) {
+            if (c.kind === 'section') await walk(c.sectionId, c.title);
+        }
+    };
+    await walk(sectionId, '');
+    return eps;
+}
+
+// ---------- Carateen (carateen.tv — كتالوج AES + HLS) ----------
+// الكتالوج مغلّف AES-256-CBC: {iv (hex), encryptedData (hex)}، المفتاح نص عادي UTF-8
+const CARATEEN_API = 'https://carateen.tv';
+const CARATEEN_KEY = '7annaba3l_loves_crypto_safe_key!';
+const CARATEEN_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Referer': 'https://carateen.tv/'
+};
+let carateenCatalogCache = null;
+let carateenCatalogAt = 0;
+
+function carateenDecrypt(d) {
+    const iv = Buffer.from(d.iv, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(CARATEEN_KEY, 'utf8'), iv);
+    let out = decipher.update(Buffer.from(d.encryptedData, 'hex'), undefined, 'utf8');
+    out += decipher.final('utf8');
+    return JSON.parse(out);
+}
+
+async function carateenCatalog() {
+    if (carateenCatalogCache && Date.now() - carateenCatalogAt < 3600000) return carateenCatalogCache;
+    const [sp, tg] = await Promise.all([
+        axios.get(`${CARATEEN_API}/api/sp/tvshows`, { headers: CARATEEN_HEADERS, timeout: 30000 }),
+        axios.get(`${CARATEEN_API}/api/tvshows`, { headers: CARATEEN_HEADERS, timeout: 30000 })
+    ]);
+    const shows = [];
+    for (const s of carateenDecrypt(sp.data)) shows.push({ id: s.id, kind: 'sp', title: s.name || '' });
+    for (const s of carateenDecrypt(tg.data)) shows.push({ id: s.id, kind: 'tg', title: s.title || '' });
+    carateenCatalogCache = shows;
+    carateenCatalogAt = Date.now();
+    return shows;
+}
+
+async function carateenSearch(query) {
+    const shows = await carateenCatalog();
+    const q = normAr(query);
+    const words = q.split(/\s+/).filter(w => w.length >= 3);
+    const hits = shows.filter(s => {
+        const t = normAr(s.title);
+        if (!t) return false;
+        if (t.includes(q)) return true;
+        return words.some(w => t.includes(w));
+    });
+    return hits.slice(0, 5).map(h => ({ id: h.id, kind: h.kind, title: h.title }));
+}
+
+async function carateenEpisodes(show) {
+    const path = show.kind === 'sp' ? `/api/sp/episodes?id=${show.id}` : `/api/episodes?id=${show.id}`;
+    const res = await axios.get(`${CARATEEN_API}${path}`, { headers: CARATEEN_HEADERS, timeout: 30000 });
+    const list = carateenDecrypt(res.data);
+    const eps = [];
+    (Array.isArray(list) ? list : []).forEach((e, i) => {
+        const n = parseInt(e.number, 10) || parseInt(String(e.title || '').match(/(\d+)/)?.[1] || '', 10) || (i + 1);
+        eps.push({ number: n, title: e.title || e.pref || (`الحلقة ${n}`), id: e.id, kind: show.kind, showId: show.id });
+    });
+    eps.sort((a, b) => a.number - b.number);
+    eps.forEach((e, i) => { e.number = i + 1; });
+    return eps;
+}
+
+async function carateenEpisodeLinks(ep) {
+    let m3u8;
+    if (ep.kind === 'sp') {
+        const res = await axios.post(`${CARATEEN_API}/api/sp/episode/link`, { episodeId: ep.id }, { headers: { ...CARATEEN_HEADERS, 'Content-Type': 'application/json' }, timeout: 30000 });
+        m3u8 = carateenDecrypt(res.data).link;
+    } else {
+        const res = await axios.get(`${CARATEEN_API}/api/episode`, { params: { episodeId: ep.id, showId: ep.showId }, headers: CARATEEN_HEADERS, timeout: 30000 });
+        m3u8 = carateenDecrypt(res.data).streamUrl;
+    }
+    if (!m3u8) throw new Error('لا يوجد رابط بث لهذه الحلقة.');
+    const pl = await axios.get(m3u8, { headers: CARATEEN_HEADERS, timeout: 30000, responseType: 'text' });
+    const lines = String(pl.data || '').split(/\r?\n/);
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+            const nameM = lines[i].match(/NAME="([^"]+)"/);
+            const resM = lines[i].match(/RESOLUTION=\d+x(\d+)/);
+            const bwM = lines[i].match(/BANDWIDTH=(\d+)/);
+            let url = lines[i + 1] && !lines[i + 1].startsWith('#') ? lines[i + 1].trim() : null;
+            if (url) {
+                if (!/^https?:\/\//i.test(url)) { try { url = new URL(url, m3u8).toString(); } catch (_) {} }
+                variants.push({ label: nameM ? nameM[1] : (resM ? `${resM[1]}p` : (bwM ? `${Math.round(bwM[1] / 1000)}kbps` : 'HLS')), url });
+            }
+        }
+    }
+    if (!variants.length) return [{ url: m3u8, label: 'Carateen — HLS', referer: 'https://carateen.tv/' }];
+    return variants.map(v => ({ url: v.url, label: `Carateen — ${v.label}`, referer: 'https://carateen.tv/' }));
+}
+
+// ok.ru للكرتون: بدون بادئة "انمي "
+async function okruSearchCartoon(query) {
+    return await okruSearchRaw(query.trim());
+}
+
+async function cartoonSearchOne(name, query) {
+    const e = CARTOON_SOURCE_NAMES[name];
+    if (!e) return [];
+    if (e.source === 'cartoondub') return await cartoonDubSearch(query);
+    if (e.source === 'carateen') return await carateenSearch(query);
+    if (e.source === 'kartoney') return await kartoneySearch(query);
+    if (e.source === 'okru') return (await okruSearchCartoon(query)).map(v => ({ id: v.id, title: v.title }));
+    if (e.source === 'dimakids') return await dimaSearch(query);
+    if (e.source === 'animezid') return await animezidSearch(query);
+    return [];
+}
+
+// ---------- DimaKids (dimakids.com — بحث JSON + mp4 مباشر موقّع) ----------
+// البحث حرفي: الاسم الكامل قد يرجع صفر ("بن تن") — جرّب الكلمات منفردة ("بن 10")
+const DIMA_API = 'https://www.dimakids.com';
+const DIMA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function dimaSearch(query) {
+    const tryOnce = async (q) => {
+        const res = await axios.get(`${DIMA_API}/search_results.php`, {
+            params: { q, ajax: 1 },
+            headers: { 'User-Agent': DIMA_UA }, timeout: 20000
+        });
+        const list = (res.data && res.data.results && res.data.results.series) || [];
+        return list.map(s => ({ id: String(s.id), title: s.title, slug: String(s.subtitle || '').trim() }));
+    };
+    let results = await tryOnce(query);
+    if (!results.length) {
+        const words = String(query).split(/\s+/).filter(w => w.length >= 3).sort((a, b) => b.length - a.length);
+        for (const w of words) {
+            results = await tryOnce(w);
+            if (results.length) break;
+        }
+    }
+    const q = normAr(query);
+    const words = q.split(/\s+/).filter(w => w.length >= 2);
+    const hits = results.filter(r => {
+        const t = normAr(r.title);
+        if (!t) return false;
+        if (t.includes(q)) return true;
+        return words.some(w => t.includes(w));
+    });
+    return (hits.length ? hits : results).slice(0, 5);
+}
+
+async function dimaEpisodes(series) {
+    const slug = String(series.slug || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9\-]/g, '');
+    const ep1Url = `${DIMA_API}/${slug}-${series.id}-anime-streaming.html`;
+    const res = await axios.get(ep1Url, { headers: { 'User-Agent': DIMA_UA, 'Referer': DIMA_API + '/' }, timeout: 20000, responseType: 'text' });
+    const html = String(res.data || '');
+    const eps = [];
+    const seen = new Set();
+    for (const it of html.matchAll(/<a[^>]*href="([^"]+?-\d+\.html)#sets"[^>]*title="([^"]+)"/g)) {
+        const title = it[2].trim();
+        const m = title.match(/الحلقة\s*(\d+)/) || title.match(/(\d+)\s*$/);
+        const num = parseInt((m || [])[1] || '', 10);
+        if (!num || seen.has(num)) continue;
+        seen.add(num);
+        const pageUrl = it[1].startsWith('http') ? it[1] : `${DIMA_API}/${it[1]}`;
+        eps.push({ number: num, title, id: pageUrl, url: pageUrl });
+    }
+    eps.sort((a, b) => a.number - b.number);
+    eps.forEach((e, i) => { e.number = i + 1; });
+    return eps;
+}
+
+async function dimaEpisodeLinks(ep) {
+    const pageUrl = ep.url || ep.id;
+    const res = await axios.get(pageUrl, { headers: { 'User-Agent': DIMA_UA, 'Referer': DIMA_API + '/' }, timeout: 20000, responseType: 'text' });
+    const mp4s = [...new Set((String(res.data || '').match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/g) || []))];
+    if (!mp4s.length) throw new Error('لا يوجد رابط mp4 في صفحة الحلقة.');
+    return [{ url: mp4s[0], label: 'DimaKids — MP4', referer: pageUrl }];
+}
+
+// ---------- AnimeZid (animezid.org — playback session + MegaMax/Uqload) ----------
+// play.php (كوكيز + CSRF) ← POST /web-playback/sessions ← resolve ← launch (60 ثانية) ← المزوّد
+// بلا Referer في طلبات الـ session (بيرجع 403)
+const AZ_API = 'https://animezid.org';
+const AZ_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function animezidSearch(query) {
+    const res = await axios.get(`${AZ_API}/search.php`, {
+        params: { keywords: query },
+        headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const out = [];
+    const seen = new Set();
+    // البطاقة: <a href=".../series/<slug>/" aria-label="فتح مسلسل <العنوان>"> (العنوان أيضاً في alt الصورة)
+    for (const m of html.matchAll(/<a[^>]*href="(?:https?:\/\/animezid\.org)?\/series\/([^"\/]+)\/?"[^>]*>/g)) {
+        const slug = decodeURIComponent(m[1]);
+        if (seen.has(slug)) continue;
+        seen.add(slug);
+        const tag = m[0];
+        let title = (tag.match(/aria-label="فتح\s+([^"]+)"/) || [])[1] || '';
+        title = title.replace(/^(مسلسل|فيلم|أنمي|انمي|كرتون)\s+/, '').trim();
+        if (!title) title = slug.replace(/-/g, ' ');
+        out.push({ id: slug, title });
+    }
+    return out.slice(0, 5);
+}
+
+async function animezidEpisodes(slug) {
+    // صفحة المسلسل → أحدث حلقة → play.php فيها قائمة الحلقات كاملة
+    const sp = await axios.get(`${AZ_API}/series/${encodeURIComponent(slug)}`, {
+        headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text'
+    });
+    const firstVid = (String(sp.data || '').match(/watch\.php\?vid=([0-9a-f]{9})/) || [])[1];
+    if (!firstVid) throw new Error('لا توجد حلقات في صفحة المسلسل.');
+    const play = await axios.get(`${AZ_API}/play.php`, {
+        params: { vid: firstVid },
+        headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text'
+    });
+    const phtml = String(play.data || '');
+    const eps = [];
+    const seen = new Set();
+    for (const m of phtml.matchAll(/<a[^>]*>/g)) {
+        const tag = m[0];
+        const vid = (tag.match(/watch\.php\?vid=([0-9a-f]{9})/) || [])[1];
+        const num = parseInt((tag.match(/الحلقة\s*(\d+)/) || [])[1] || '', 10);
+        if (vid && num && !seen.has(num)) {
+            seen.add(num);
+            eps.push({ number: num, title: `الحلقة ${num}`, id: vid });
+        }
+    }
+    if (!eps.length) {
+        const vids = [...new Set(phtml.match(/watch\.php\?vid=([0-9a-f]{9})/g) || [])].map(x => x.match(/vid=([0-9a-f]{9})/)[1]);
+        vids.forEach((v, i) => eps.push({ number: i + 1, title: `الحلقة ${i + 1}`, id: v }));
+    }
+    eps.sort((a, b) => a.number - b.number);
+    return eps;
+}
+
+async function animezidEpisodeLinks(ep) {
+    const vid = ep.id;
+    const play = await axios.get(`${AZ_API}/play.php`, {
+        params: { vid },
+        headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text'
+    });
+    const cookies = (play.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+    const csrf = (String(play.data || '').match(/data-playback-csrf\s*=\s*"([^"]+)"/) || [])[1];
+    if (!csrf) throw new Error('لم يتم العثور على توكن التشغيل.');
+    const H = { 'User-Agent': AZ_UA, 'Content-Type': 'application/json', 'X-Playback-CSRF': csrf, 'Origin': AZ_API, 'Cookie': cookies };
+    const sess = await axios.post(`${AZ_API}/web-playback/sessions`, { content_id: vid }, { headers: H, timeout: 20000 });
+    const sid = sess.data && sess.data.session_id;
+    const sources = (sess.data && sess.data.sources) || [];
+    if (!sid || !sources.length) throw new Error('لا توجد سيرفرات متاحة لهذه الحلقة.');
+    const links = [];
+    const resolve = async (srcId) => {
+        const r = await axios.post(`${AZ_API}/web-playback/sessions/${sid}/sources/${srcId}/resolve`, {}, { headers: H, timeout: 20000 });
+        return r.data && r.data.launch_url;
+    };
+    const followLaunch = async (launchUrl) => {
+        const r = await axios.get(launchUrl, { headers: { 'User-Agent': AZ_UA, 'Cookie': cookies }, timeout: 20000, maxRedirects: 0, validateStatus: s => s < 500 });
+        return r.headers.location || null;
+    };
+    // 1) MegaMax أولاً (أعلى جودة) — جرّب mp4upload في كل جودة (ملفاته بتموت أحياناً)
+    const mega = sources.find(s => s.provider === 'MegaMax');
+    if (mega) {
+        try {
+            const launch = await resolve(mega.id);
+            const dest = launch ? await followLaunch(launch) : null;
+            if (dest && dest.includes('megamax.me/iframe/')) {
+                const page = await axios.get(dest, { headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text' });
+                const appM = String(page.data || '').match(/<script[^>]*data-page="app"[^>]*>([\s\S]*?)<\/script>/);
+                if (appM) {
+                    const app = JSON.parse(appM[1]);
+                    const partial = await axios.get(dest, {
+                        headers: { 'User-Agent': AZ_UA, 'X-Inertia': 'true', 'X-Inertia-Version': app.version, 'X-Inertia-Partial-Component': 'files/mirror/video', 'X-Inertia-Partial-Data': 'streams' },
+                        timeout: 20000, responseType: 'text'
+                    });
+                    const streams = (JSON.parse(partial.data).props && JSON.parse(partial.data).props.streams && JSON.parse(partial.data).props.streams.data) || [];
+                    for (const st of streams) {
+                        // mp4upload أولاً (mp4 مباشر)، ثم uqload (m3u8)
+                        const mp4 = (st.mirrors || []).find(m => m.driver === 'mp4upload');
+                        if (mp4) {
+                            try {
+                                const embUrl = mp4.link.startsWith('http') ? mp4.link : 'https:' + mp4.link;
+                                const emb = await axios.get(embUrl, { headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text' });
+                                const mm = String(emb.data || '').match(/player\.src\(\{\s*type:\s*"video\/mp4",\s*src:\s*"(https:\/\/a\d+\.mp4upload\.com:183\/d\/[^"]+\/video\.mp4)"/);
+                                if (mm) links.push({ url: mm[1], label: `AnimeZid — ${st.label} (mp4upload)`, referer: embUrl });
+                            } catch (_) {}
+                        }
+                        const uqm = (st.mirrors || []).find(m => m.driver === 'uqload');
+                        if (uqm) {
+                            try {
+                                const embUrl = uqm.link.startsWith('http') ? uqm.link : 'https:' + uqm.link;
+                                const m3u8 = await extractUqloadM3u8(embUrl);
+                                const plRes = await axios.get(m3u8, { headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text' });
+                                const variants = parseM3u8Variants(String(plRes.data || ''), m3u8);
+                                if (variants.length) {
+                                    for (const v of variants) links.push({ url: v.url, label: `AnimeZid — ${st.label} ${v.label} (Uqload)`, referer: 'https://uqload.com/' });
+                                } else {
+                                    links.push({ url: m3u8, label: `AnimeZid — ${st.label} (Uqload)`, referer: 'https://uqload.com/' });
+                                }
+                            } catch (_) {}
+                        }
+                    }
+                }
+            }
+        } catch (_) {}
+    }
+    // 2) Uqload (احتياطي موثوق) — m3u8 بجوداته
+    const uq = sources.find(s => s.provider === 'Uqload' && s.type === 'embedded_web');
+    if (uq) {
+        try {
+            const launch = await resolve(uq.id);
+            const dest = launch ? await followLaunch(launch) : null;
+            if (dest && dest.includes('uqload')) {
+                const m3u8 = await extractUqloadM3u8(dest);
+                const plRes = await axios.get(m3u8, { headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text' });
+                const variants = parseM3u8Variants(String(plRes.data || ''), m3u8);
+                if (variants.length) {
+                    for (const v of variants) links.push({ url: v.url, label: `AnimeZid — ${v.label} (Uqload)`, referer: 'https://uqload.com/' });
+                } else {
+                    links.push({ url: m3u8, label: 'AnimeZid — HLS (Uqload)', referer: 'https://uqload.com/' });
+                }
+            }
+        } catch (_) {}
+    }
+    if (!links.length) throw new Error('لا توجد روابط تحميل متاحة لهذه الحلقة (كل السيرفرات ميتة حالياً).');
+    return links;
 }
 
 
@@ -3827,6 +4281,178 @@ async function startXeonBotInc() {
                         }
                     }
 
+                    // ── اختيار كرتون/حلقة من نتائج .cartoon (متعدد المصادر) ──
+                    if (cartoonCache.has(quotedId)) {
+                        const cachedData = cartoonCache.get(quotedId);
+                        const num = parseInt(String(replyText).trim());
+                        if (isNaN(num) || num < 1) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                            return;
+                        }
+
+                        // ── المرحلة 1: اختيار كرتون من نتائج البحث ──
+                        if (cachedData.stage === 'search') {
+                            const selected = cachedData.results[num - 1];
+                            if (!selected) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                                return;
+                            }
+                            cartoonCache.delete(quotedId);
+
+                            // ok.ru → استخراج الجودات مباشرة
+                            if (selected.source === 'okru') {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `⏳ جاري استخراج الجودات لـ\n*${selected.title}*...`
+                                }, { quoted: mek });
+                                try {
+                                    const { title, videos } = await extractOkruVideo(`https://ok.ru/video/${selected.id}`);
+                                    const links = videos.map(v => v.url);
+                                    const names = videos.map(v => OKRU_QUALITY_LABELS[v.name] || v.name || 'غير معروفة');
+                                    let qualityResponseText = `🍿 *اختر جودة التحميل:*\n🎬 ${title}\n\n`;
+                                    names.forEach((qName, i) => {
+                                        qualityResponseText += `*${i + 1}* - ${qName}\n`;
+                                    });
+                                    qualityResponseText += `\n💡 قم **بالرد (Reply)** على هذه الرسالة برقم الجودة المطلوبة.`;
+                                    const sentQualityMsg = await XeonBotInc.sendMessage(chatId, { text: qualityResponseText }, { quoted: mek });
+                                    qualityCache.set(sentQualityMsg.key.id, {
+                                        links, names, title,
+                                        referer: 'https://ok.ru/',
+                                        headers: {},
+                                        timestamp: Date.now()
+                                    });
+                                    setTimeout(() => qualityCache.delete(sentQualityMsg.key.id), 300000);
+                                } catch (err) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `❌ ${err.message}`
+                                    }, { quoted: mek });
+                                }
+                                return;
+                            }
+
+                            // باقي المصادر → جلب الحلقات
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ جاري جلب حلقات *${selected.title}*...`
+                            }, { quoted: mek });
+                            try {
+                                let episodes = [];
+                                if (selected.source === 'cartoondub') {
+                                    episodes = await cartoonDubEpisodes(selected.id);
+                                } else if (selected.source === 'carateen') {
+                                    episodes = await carateenEpisodes(selected);
+                                } else if (selected.source === 'kartoney') {
+                                    episodes = await kartoneyEpisodes(selected.id);
+                                } else if (selected.source === 'dimakids') {
+                                    episodes = await dimaEpisodes(selected);
+                                } else if (selected.source === 'animezid') {
+                                    episodes = await animezidEpisodes(selected.id);
+                                }
+                                if (!episodes.length) throw new Error('لا توجد حلقات.');
+                                let epText = `📺 *${selected.title}*\n🔢 عدد الحلقات: ${episodes.length}\n\n`;
+                                episodes.slice(0, 10).forEach(e => {
+                                    epText += `*${e.number}* - ${e.title || ('الحلقة ' + e.number)}\n`;
+                                });
+                                if (episodes.length > 10) epText += `…\n`;
+                                epText += `\n💡 رد (Reply) على هذه الرسالة برقم الحلقة، أو بمدى مثل 1-15 لتحميل عدة حلقات دفعة واحدة.`;
+                                const sentEp = await XeonBotInc.sendMessage(chatId, { text: epText }, { quoted: mek });
+                                cartoonCache.set(sentEp.key.id, {
+                                    stage: 'episodes', source: selected.source, cdSource: null,
+                                    cartoonId: selected.id, kind: selected.kind || null, title: selected.title, episodes,
+                                    timestamp: Date.now()
+                                });
+                                setTimeout(() => cartoonCache.delete(sentEp.key.id), 300000);
+                            } catch (err) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ فشل جلب الحلقات:\n\`${err.message}\``
+                                }, { quoted: mek });
+                            }
+                            return;
+                        }
+
+                        // ── المرحلة 2: اختيار الحلقة (أو مدى حلقات مثل 1-15) ──
+                        if (cachedData.stage === 'episodes') {
+                            // ── تحميل مدى حلقات ──
+                            const rangeMatch = String(replyText).trim().match(/^(\d+)\s*-\s*(\d+)$/);
+                            if (rangeMatch) {
+                                const start = parseInt(rangeMatch[1], 10);
+                                const end = parseInt(rangeMatch[2], 10);
+                                const total = cachedData.episodes.length;
+                                if (start < 1 || end < start || end > total || (end - start + 1) > 20) {
+                                    await XeonBotInc.sendMessage(chatId, { text: `❌ مدى غير صحيح. اكتب مدى مثل 1-15 (بحد أقصى 20 حلقة، والكرتون فيه ${total} حلقة).` }, { quoted: mek });
+                                    return;
+                                }
+                                const wanted = cachedData.episodes.filter(e => e.number >= start && e.number <= end).sort((a, b) => a.number - b.number);
+                                if (!wanted.length) {
+                                    await XeonBotInc.sendMessage(chatId, { text: '❌ لا توجد حلقات في هذا المدى.' }, { quoted: mek });
+                                    return;
+                                }
+                                cartoonCache.delete(quotedId);
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `⏳ جاري جلب سيرفرات الحلقات ${start}-${end} (${wanted.length} حلقة)...`
+                                }, { quoted: mek });
+                                try {
+                                    const batch = [];
+                                    const failedNums = [];
+                                    for (const ep of wanted) {
+                                        try {
+                                            const resolved = await resolveAnimeEpisodeLinks(cachedData.source, cachedData.cdSource, cachedData.cartoonId, ep);
+                                            if (resolved.length) batch.push({ number: ep.number, links: resolved, referer: (resolved[0] && resolved[0].referer) || '' });
+                                            else failedNums.push(ep.number);
+                                        } catch (_) { failedNums.push(ep.number); }
+                                    }
+                                    if (!batch.length) throw new Error('لا توجد روابط تحميل متاحة لأي حلقة في هذا المدى.');
+                                    let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${cachedData.title} — الحلقات ${start}-${end} (${batch.length} حلقة جاهزة${failedNums.length ? `، فشلت: ${failedNums.join('، ')}` : ''})\n\n`;
+                                    batch[0].links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
+                                    qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة، وسيتم تحميل كل الحلقات بنفس الجودة.`;
+                                    const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                    qualityCache.set(sentQ.key.id, {
+                                        links: batch[0].links.map(r => r.url),
+                                        names: batch[0].links.map(r => r.label),
+                                        title: `${cachedData.title} - الحلقات ${start}-${end}`,
+                                        referer: batch[0].referer, headers: {},
+                                        batch: batch.map(b => ({ number: b.number, links: b.links, referer: b.referer })),
+                                        timestamp: Date.now()
+                                    });
+                                    setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                                } catch (err) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `❌ فشل جلب السيرفرات:\n\`${err.message}\``
+                                    }, { quoted: mek });
+                                }
+                                return;
+                            }
+                            const ep = cachedData.episodes.find(e => e.number === num);
+                            if (!ep) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم حلقة غير صحيح.' }, { quoted: mek });
+                                return;
+                            }
+                            cartoonCache.delete(quotedId);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ جاري جلب سيرفرات الحلقة ${ep.number}...`
+                            }, { quoted: mek });
+                            try {
+                                const resolved = await resolveAnimeEpisodeLinks(cachedData.source, cachedData.cdSource, cachedData.cartoonId, ep);
+                                if (!resolved.length) throw new Error('لا توجد روابط تحميل متاحة لهذه الحلقة.');
+                                let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${cachedData.title} — الحلقة ${ep.number}\n\n`;
+                                resolved.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
+                                qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة.`;
+                                const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                qualityCache.set(sentQ.key.id, {
+                                    links: resolved.map(r => r.url),
+                                    names: resolved.map(r => r.label),
+                                    title: `${cachedData.title} - الحلقة ${ep.number}`,
+                                    referer: (resolved[0] && resolved[0].referer) || '', headers: {},
+                                    timestamp: Date.now()
+                                });
+                                setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                            } catch (err) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ فشل جلب السيرفرات:\n\`${err.message}\``
+                                }, { quoted: mek });
+                            }
+                            return;
+                        }
+                    }
+
                     // ── اختيار فيلم/مسلسل/حلقة من نتائج .movie / .series (متعدد المصادر) ──
                     if (mvCache.has(quotedId)) {
                         const cachedData = mvCache.get(quotedId);
@@ -4030,6 +4656,9 @@ async function startXeonBotInc() {
                     text.startsWith('.anime') ||
                     text.startsWith('.setanime') ||
                     text.startsWith('.animeset') ||
+                    text.startsWith('.cartoon') ||
+                    text.startsWith('.setcartoon') ||
+                    text.startsWith('.cartoonapi') ||
                     text.startsWith('.series') ||
                     text.startsWith('.manga') ||
                     text.startsWith('.movie') ||
@@ -5913,6 +6542,136 @@ async function startXeonBotInc() {
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل الفحص:\n\`${err.message}\`` }, { quoted: mek });
                         }
+                        return;
+                    }
+
+                    // ── أمر .cartoon (كرتون قديم مدبلج — 6 مصادر) ──
+                    if (command === '.cartoon') {
+                        if (!query) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '❌ يرجى كتابة اسم الكرتون.\n💡 *مثال:* `.cartoon سيف النار` أو `.cartoon بن تن`'
+                            }, { quoted: mek });
+                            return;
+                        }
+                        try {
+                            const locked = cartoonLockedSource ? CARTOON_SOURCE_NAMES[cartoonLockedSource] : null;
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: locked
+                                    ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
+                                    : `🔍 جاري البحث عن *${query}* في 6 مصادر...`
+                            }, { quoted: mek });
+
+                            const results = [];
+                            const seenTitles = new Set();
+                            const addResults = (source, list, max) => {
+                                for (const it of (Array.isArray(list) ? list : []).slice(0, max)) {
+                                    const key = String(it.title || '').trim().toLowerCase();
+                                    if (!key || seenTitles.has(key)) continue;
+                                    seenTitles.add(key);
+                                    results.push({ source, id: it.id, kind: it.kind || null, title: it.title });
+                                }
+                            };
+                            if (locked) {
+                                // مصدر واحد مثبّت عبر .setcartoon — نفس الكود، مصدر واحد فقط
+                                const list = await cartoonSearchOne(cartoonLockedSource, query);
+                                addResults(locked.source, list, 10);
+                            } else {
+                                // بحث متوازي في المصادر الستة — فشل مصدر لا يوقف الباقي
+                                const [dub, carateen, kartoney, okru, dima, az] = await Promise.allSettled([
+                                    cartoonDubSearch(query),
+                                    carateenSearch(query),
+                                    kartoneySearch(query),
+                                    okruSearchCartoon(query),
+                                    dimaSearch(query),
+                                    animezidSearch(query)
+                                ]);
+                                if (dub.status === 'fulfilled') addResults('cartoondub', dub.value, 3);
+                                if (carateen.status === 'fulfilled') addResults('carateen', carateen.value, 3);
+                                if (kartoney.status === 'fulfilled') addResults('kartoney', kartoney.value, 2);
+                                if (okru.status === 'fulfilled') addResults('okru', okru.value.map(v => ({ id: v.id, title: v.title })), 2);
+                                if (dima.status === 'fulfilled') addResults('dimakids', dima.value, 2);
+                                if (az.status === 'fulfilled') addResults('animezid', az.value, 2);
+                            }
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setcartoon <مصدر آخر>\`.` : 'لم يتم العثور على أي نتائج في المصادر الستة. جرّب اسماً مختلفاً.');
+
+                            const tagOf = s => s === 'cartoondub' ? '🎨 CartoonDub' : s === 'carateen' ? '📺 Carateen' : s === 'kartoney' ? '🧒 Kartoney' : s === 'okru' ? '📺 ok.ru' : s === 'dimakids' ? '🎬 DimaKids' : '🌟 AnimeZid';
+                            let responseText = `🎨 *نتائج البحث (كرتون قديم مدبلج):*\n\n`;
+                            results.slice(0, 15).forEach((r, index) => {
+                                responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
+                            });
+                            responseText += `\n💡 *طريقة الاختيار:*\nقم **بالرد (Reply)** على هذه الرسالة برقم الكرتون المطلوب.\n\n🍿 *مثال:* \`1\``;
+
+                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                            cartoonCache.set(sentMsg.key.id, {
+                                stage: 'search',
+                                results: results.slice(0, 15),
+                                timestamp: Date.now()
+                            });
+                            setTimeout(() => cartoonCache.delete(sentMsg.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .cartoonapi (فحص حالة مصادر الكرتون) ──
+                    if (command === '.cartoonapi') {
+                        try {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '🔍 جاري فحص مصادر الكرتون...'
+                            }, { quoted: mek });
+                            const probes = [
+                                { name: '🎨 CartoonDub', fn: async () => { const r = await cartoonDubSearch('بن تن'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 Carateen', fn: async () => { const r = await carateenSearch('سيف النار'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🧒 Kartoney', fn: async () => { const r = await kartoneySearch('الكابتن ماجد'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 ok.ru', fn: async () => { const r = await okruSearchCartoon('الرمية الملتهبة'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎬 DimaKids', fn: async () => { const r = await dimaSearch('سيف النار'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🌟 AnimeZid', fn: async () => { const r = await animezidSearch('سيف النار'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                            ];
+                            const settled = await Promise.allSettled(probes.map(async p => {
+                                const t = Date.now();
+                                const n = await p.fn();
+                                return { name: p.name, ms: Date.now() - t, n };
+                            }));
+                            let out = `📊 *حالة مصادر الكرتون:*\n\n`;
+                            settled.forEach((s, i) => {
+                                if (s.status === 'fulfilled') {
+                                    out += `🟢 *${s.value.name}* — شغال (${s.value.ms}ms، ${s.value.n} نتيجة)\n`;
+                                } else {
+                                    out += `🔴 *${probes[i].name}* — متوقف (${String((s.reason && s.reason.message) || 'خطأ').slice(0, 80)})\n`;
+                                }
+                            });
+                            out += `\n🕐 ${new Date().toLocaleString('ar-EG', { timeZone: 'Africa/Cairo' })}`;
+                            await XeonBotInc.sendMessage(chatId, { text: out }, { quoted: mek });
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل الفحص:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .setcartoon (تثبيت مصدر واحد لـ .cartoon) ──
+                    if (command === '.setcartoon') {
+                        const name = query.toLowerCase().trim();
+                        const namesList = CARTOON_SOURCE_LIST.join('، ');
+                        if (!name) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: cartoonLockedSource
+                                    ? `📌 المصدر المثبّت حالياً: *${CARTOON_SOURCE_NAMES[cartoonLockedSource].label}*\n\n💡 للتبديل: \`.setcartoon <اسم المصدر>\`\nللرجوع لكل المصادر: \`.setcartoon all\`\n\nالمصادر المتاحة: ${namesList}`
+                                    : `📌 لا يوجد مصدر مثبّت — البحث في كل المصادر.\n\n💡 للتثبيت على مصدر واحد: \`.setcartoon <اسم المصدر>\`\n\nالمصادر المتاحة: ${namesList}`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        if (name === 'all' || name === 'off' || name === 'none' || name === 'الكل') {
+                            cartoonLockedSource = null;
+                            await XeonBotInc.sendMessage(chatId, { text: '✅ تم الرجوع للبحث في كل المصادر.' }, { quoted: mek });
+                            return;
+                        }
+                        if (!CARTOON_SOURCE_NAMES[name]) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ مصدر غير معروف: *${name}*\n\nالمصادر المتاحة: ${namesList}` }, { quoted: mek });
+                            return;
+                        }
+                        cartoonLockedSource = name;
+                        await XeonBotInc.sendMessage(chatId, { text: `✅ تم تثبيت مصدر الكرتون على: *${CARTOON_SOURCE_NAMES[name].label}*\n\n🔍 أمر .cartoon سيبحث فيه فقط الآن. عند وقوعه، بدّله بأمر \`.setcartoon <مصدر آخر>\` أو ارجع للكل بـ \`.setcartoon all\`.` }, { quoted: mek });
                         return;
                     }
 
