@@ -711,7 +711,14 @@ const OKRU_QUALITY_LABELS = {
 // بحث فيديوهات ok.ru → [{id, title}]
 // النتائج مضمّنة في HTML كـ JSON مُشفّر بـ HTML entities
 async function okruSearchAnime(query) {
-    const q = /^\s*انمي/.test(query) ? query.trim() : `انمي ${query.trim()}`;
+    const results = await okruSearchRaw(/^\s*انمي/.test(query) ? query.trim() : `انمي ${query.trim()}`);
+    if (results.length) return results;
+    // كرتون قديم/غير أنمي: "انمي <الاسم>" ترجع صفر — أعد البحث بدون البادئة
+    if (!/^\s*انمي/.test(query)) return await okruSearchRaw(query.trim());
+    return results;
+}
+
+async function okruSearchRaw(q) {
     const url = `https://ok.ru/video/search/${encodeURIComponent(q)}`;
     const res = await axios.get(url, { headers: OKRU_PAGE_HEADERS, timeout: 25000 });
     const html = res.data;
@@ -895,11 +902,11 @@ function cloudDayDecryptServers(b64) {
 }
 
 // بحث CloudDay → [{id, type, name}]
-async function cloudDaySearch(query, srcName) {
+async function cloudDaySearch(query, srcName, type = '0') {
     const src = CLOUDDAY_SOURCES.find(s => s.name === srcName);
     const base = await cloudDayResolveBase(src);
     const res = await axios.post(`${base}/search`,
-        new URLSearchParams({ title: query, type: '0', sort: '1', page: '1' }).toString(),
+        new URLSearchParams({ title: query, type, sort: '1', page: '1' }).toString(),
         { headers: { 'User-Agent': CLOUDDAY_UA, 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000 });
     const results = Array.isArray(res.data && res.data.results) ? res.data.results : [];
     return results.map(r => ({ id: String(r.id), type: r.type || 'series', name: r.name || r.title || '' }));
@@ -941,7 +948,13 @@ async function cloudDayResolveLinks(links) {
     const out = [];
     for (const link of links) {
         try {
-            const pd = link.match(/pixeldrain\.com\/u\/([A-Za-z0-9]+)/i);
+            if (/uqload/i.test(link)) {
+                try {
+                    const m3u8 = await extractUqloadM3u8(link);
+                    out.push({ url: m3u8, label: 'UQLOAD — HLS', referer: 'https://uqload.com/' });
+                } catch (_) {}
+            }
+            const pd = /uqload/i.test(link) ? null : link.match(/pixeldrain\.com\/u\/([A-Za-z0-9]+)/i);
             if (pd) {
                 let label = 'PixelDrain';
                 try {
@@ -953,7 +966,7 @@ async function cloudDayResolveLinks(links) {
                 // الـ worker يعيد توجيه 302 إلى mp4 مباشر — نقرأ Location فقط بدون تحميل
                 const r = await axios.get(link, { timeout: 15000, maxRedirects: 0, validateStatus: s => s >= 200 && s < 400 });
                 if (r.headers && r.headers.location) out.push({ url: r.headers.location, label: 'ok.ru CDN' });
-            } else if (/^https?:\/\/.*\.(mp4|m3u8)(\?|$)/i.test(link)) {
+            } else if (/^https?:\/\/.*\.(mp4|m3u8)(\?|$)/i.test(link) && !/uqload/i.test(link)) {
                 out.push({ url: link, label: 'رابط مباشر' });
             }
         } catch (_) {}
@@ -1359,7 +1372,11 @@ async function kartoneySearch(query) {
     const matches = (url, title) => {
         if (!nq) return true;
         const slug = decodeURIComponent(url.split('/cartoon/')[1].replace(/\/$/, ''));
-        return normAr(title).includes(nq) || normAr(slug.replace(/[-_]+/g, ' ')).includes(nq) || title.toLowerCase().includes(q.toLowerCase());
+        const hay = normAr(title) + ' ' + normAr(slug.replace(/[-_]+/g, ' '));
+        if (hay.includes(nq) || title.toLowerCase().includes(q.toLowerCase())) return true;
+        // مطابقة بأي كلمة (≥3 أحرف) — "الكرة الملتهبة" تجد "الرمية الملتهبة"
+        const words = nq.split(/\s+/).filter(w => w.length >= 3);
+        return words.some(w => hay.includes(w));
     };
     // المصدر الأساسي: JSON-LD في صفحة المكتبة (166 عمل — الاسم العربي + الرابط)
     const items = [...String(html).matchAll(/\{"@type":"ListItem","position":\d+,"url":"(https:\/\/kartoney\.com\/cartoon\/[^"]+\/)","name":"([^"]+)"/g)];
@@ -1712,6 +1729,499 @@ async function resolveAnimeEpisodeLinks(source, cdSource, animeId, ep) {
 // ============================================================
 // دالة بناء ZIP بدون مكتبات خارجية
 // ============================================================
+
+// ============================================================
+// أفلام ومسلسلات — 5 مصادر (akwam + CloudDay + MeowTv + CinemaPlus + VioLa)
+// نفس منطق .anime: بحث متوازي → قائمة مرقّمة → حلقات (للمسلسلات) → جودات → تحميل
+// ============================================================
+const mvCache = new Map();
+
+// ── تثبيت مصدر واحد لـ .movie / .series (عبر .setmv) ──
+let mvLockedSource = null; // null = البحث في كل المصادر
+const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola'];
+const MV_SOURCE_NAMES = {
+    akwam: { source: 'akwam', label: '📺 Akwam' },
+    cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
+    cloudday: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
+    meowtv: { source: 'meowtv', label: '🐱 MeowTv' },
+    cinemaplus: { source: 'cinemaplus', label: '🎬 CinemaPlus' },
+    viola: { source: 'viola', label: '🎭 VioLa' }
+};
+
+// ---------- akwam: أفلام ومسلسلات ----------
+function extractAkwamMovies(html) {
+    const results = [];
+    const regex = /href="(https?:\/\/akwam\.ss\/movie\/[^"#?]+)"/g;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        const url = m[1].split('?')[0];
+        if (!results.some(r => r.url === url)) {
+            const slug = url.replace(/.*\/movie\//, '').replace(/\/$/, '');
+            results.push({ url, name: decodeURIComponent(slug).replace(/-/g, ' ') });
+        }
+    }
+    return results;
+}
+
+// بحث akwam: الاسم الكامل أولاً، ولو صفر نتائج جرّب أطول كلمة (بحث الموقع ضعيف مع الكلمات المتعددة)
+async function akwamSearch(query, kind) {
+    const tryOnce = async (q) => {
+        const html = await akwamFetch(`https://akwam.ss/search?q=${encodeURIComponent(q)}`);
+        return kind === 'movie' ? extractAkwamMovies(html) : extractAkwamSeries(html);
+    };
+    let results = await tryOnce(query);
+    if (!results.length) {
+        const words = String(query).split(/\s+/).filter(w => w.length >= 4).sort((a, b) => b.length - a.length);
+        if (words.length) results = await tryOnce(words[0]);
+    }
+    return results.map(r => ({ id: r.url, title: r.name, type: kind === 'movie' ? 'movie' : 'series' }));
+}
+
+function akwamQualityName(url) {
+    const u = String(url || '').toLowerCase();
+    if (u.includes('1080') || u.includes('fhd')) return '🔵 FHD 1080p';
+    if (u.includes('720') || u.includes('hd')) return '🟢 HD 720p';
+    if (u.includes('480') || u.includes('sd')) return '🟡 SD 480p';
+    if (u.includes('360')) return '🟠 360p';
+    return `⚪ جودة ${String(url).match(/(\d{3,4}p)/i)?.[1] || 'غير معروفة'}`;
+}
+
+// ---------- MeowTv (api.meowtv.ru + TMDB) ----------
+const MEOW_API = 'https://api.meowtv.ru';
+const MEOW_TMDB = 'https://api.themoviedb.org/3';
+const MEOW_TMDB_KEY = '06f120992cfacd7c118f6e7086d23544'; // مفتاح TMDB عام مضمّن في كود مزوّد CloudStream
+const MEOW_STATIC_KEY = '10eE3wyyhkF38rwLFwisRYgwP2bbTL_Y';
+const MEOW_SERVERS = ['dcloud', 'doppler', 'acme', 'tik', 'ipcloud', 'turkce', 'hindi', 'english', 'febbox'];
+const MEOW_UA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36';
+const MEOW_HEADERS = { 'Origin': 'https://meowtv.ru', 'Referer': 'https://meowtv.ru/', 'User-Agent': MEOW_UA };
+
+// توكن جديد لكل سيرفر (سلوك التطبيق نفسه — التوكن يعيش ~58 ثانية)
+async function meowTicket() {
+    const res = await axios.post(`${MEOW_API}/streams/ticket`, {}, { headers: { ...MEOW_HEADERS, 'Content-Type': 'application/json' }, timeout: 15000 });
+    const ticket = res.data && res.data.ticket;
+    if (!ticket) throw new Error('MeowTv: لا توكن.');
+    return ticket;
+}
+
+// فك تشفير MeowTv: sha = SHA-256(المفتاح الثابت + n) ثم XOR دوري 32 بايت
+function meowDecrypt(n, d) {
+    try {
+        const sha = crypto.createHash('sha256').update(MEOW_STATIC_KEY + n, 'utf8').digest();
+        const cipher = Buffer.from(d, 'base64');
+        const plain = Buffer.alloc(cipher.length);
+        for (let i = 0; i < cipher.length; i++) plain[i] = cipher[i] ^ sha[i % 32];
+        const text = plain.toString('utf8');
+        if (!text.includes('{')) return null;
+        return JSON.parse(text);
+    } catch (_) { return null; }
+}
+
+async function meowSearch(query, kind) {
+    const res = await axios.get(`${MEOW_TMDB}/search/multi`, {
+        params: { api_key: MEOW_TMDB_KEY, language: 'en-US', query, page: 1 },
+        headers: { 'User-Agent': MEOW_UA }, timeout: 20000
+    });
+    const list = Array.isArray(res.data && res.data.results) ? res.data.results : [];
+    const want = kind === 'movie' ? 'movie' : 'tv';
+    return list.filter(r => r.media_type === want).slice(0, 10).map(r => ({
+        id: String(r.id),
+        title: `${r.title || r.name || ''}${r.release_date || r.first_air_date ? ` (${String(r.release_date || r.first_air_date).slice(0, 4)})` : ''}`.trim(),
+        type: want === 'movie' ? 'movie' : 'series'
+    }));
+}
+
+async function meowEpisodes(tmdbId) {
+    const res = await axios.get(`${MEOW_TMDB}/tv/${tmdbId}`, {
+        params: { api_key: MEOW_TMDB_KEY, language: 'en-US' },
+        headers: { 'User-Agent': MEOW_UA }, timeout: 20000
+    });
+    const seasons = (res.data && res.data.seasons || []).filter(s => s.season_number > 0 && s.episode_count > 0);
+    const eps = [];
+    const seasonLists = await Promise.allSettled(seasons.map(s =>
+        axios.get(`${MEOW_TMDB}/tv/${tmdbId}/season/${s.season_number}`, {
+            params: { api_key: MEOW_TMDB_KEY, language: 'en-US' },
+            headers: { 'User-Agent': MEOW_UA }, timeout: 20000
+        }).then(r => ({ season: s.season_number, list: (r.data && r.data.episodes) || [] }))
+    ));
+    for (const sl of seasonLists) {
+        if (sl.status !== 'fulfilled') continue;
+        for (const e of sl.value.list) {
+            eps.push({
+                id: `${tmdbId}:${sl.value.season}:${e.episode_number}`,
+                number: eps.length + 1,
+                season: sl.value.season,
+                episode: e.episode_number,
+                title: `الموسم ${sl.value.season} — الحلقة ${e.episode_number}`
+            });
+        }
+    }
+    return eps;
+}
+
+// ترجمة عربية VTT لـ MeowTv (ملف منفصل يُدمج في الـ mp4 عند التحميل)
+async function meowSubs(tmdbId, kind, season, episode) {
+    try {
+        const path = kind === 'movie' ? `/subs/movie/${tmdbId}` : `/subs/tv/${tmdbId}/${season}/${episode}`;
+        const res = await axios.get(`${MEOW_API}${path}`, { headers: MEOW_HEADERS, timeout: 15000 });
+        const arr = Array.isArray(res.data) ? res.data : [];
+        const ar = arr.find(s => /arabic/i.test(s.label || '')) || arr.find(s => /^ar$/i.test((s.label || '').trim()));
+        return ar && ar.file ? ar.file : null;
+    } catch (_) { return null; }
+}
+
+// سيرفرات MeowTv → روابط m3u8 (بحد أقصى 3 روابط شغالة — الـ API يحظر عند الإفراط)
+async function meowStreams(tmdbId, kind, season, episode) {
+    const streamPath = kind === 'movie' ? `/streams/movie/${tmdbId}` : `/streams/tv/${tmdbId}/${season}/${episode}`;
+    const out = [];
+    for (const server of MEOW_SERVERS) {
+        if (out.length >= 3) break;
+        try {
+            const ticket = await meowTicket();
+            const res = await axios.get(`${MEOW_API}${streamPath}?s=${server}`, {
+                headers: { ...MEOW_HEADERS, 'x-stream-ticket': ticket },
+                timeout: 20000, validateStatus: s => s < 500
+            });
+            if (res.status !== 200 || !res.data || !res.data.n || !res.data.d) continue;
+            const stream = meowDecrypt(res.data.n, res.data.d);
+            if (!stream) continue;
+            const urls = [];
+            if (typeof stream.url === 'string' && /^https?:\/\//i.test(stream.url)) urls.push(stream.url);
+            if (Array.isArray(stream.streams)) {
+                for (const s of stream.streams) {
+                    if (s && typeof s.url === 'string' && /^https?:\/\//i.test(s.url)) urls.push(s.url);
+                }
+            }
+            for (const u of urls) {
+                out.push({ url: u, label: `MeowTv — ${server}`, referer: 'https://meowtv.ru/' });
+            }
+        } catch (_) {}
+    }
+    return out.slice(0, 3);
+}
+
+// ---------- CinemaPlus (e-droid) ----------
+const CPLUS_CONFIG_URL = 'https://config.e-droid.net/srv/config.php?v=211&vname=3.0&idapp=3796813&idusu=0&cod_g=&gp=0&am=0&idl=en&pa_env=1&pa=GB&pn=cinema.plus&fus=010100000000&aid=7db3574f7ef4288a';
+const CPLUS_UA = 'Android Vinebre Software';
+const CPLUS_GET_HTML = 'https://html.e-droid.net/html/get_html.php?ida=3796813&ids=%s';
+let cplusConfigCache = { at: 0, items: [] };
+
+async function cinemaPlusConfig() {
+    if (cplusConfigCache.items.length && Date.now() - cplusConfigCache.at < 3600000) return cplusConfigCache.items;
+    const res = await axios.get(CPLUS_CONFIG_URL, { headers: { 'User-Agent': CPLUS_UA }, timeout: 25000 });
+    const body = String(res.data || '');
+    const sections = {};
+    const re = /\[s(\d+)_(\w+)=([^\]]*)\]/g;
+    let m;
+    while ((m = re.exec(body)) !== null) {
+        (sections[m[1]] = sections[m[1]] || {})[m[2]] = m[3];
+    }
+    const items = [];
+    for (const [pageId, d] of Object.entries(sections)) {
+        if (d.tipo !== '2') continue;
+        const title = String(d.tit || '').replace(/\s*logo$/i, '').trim();
+        if (!title || ['الرئيسية', 'الرئيسيه', 'اكتشف'].some(x => title.includes(x))) continue;
+        const tmdbId = parseInt(d.idgo, 10);
+        if (!tmdbId) continue;
+        items.push({ pageId, title, tmdbId });
+    }
+    if (items.length) cplusConfigCache = { at: Date.now(), items };
+    return items;
+}
+
+async function cinemaPlusSearch(query) {
+    const items = await cinemaPlusConfig();
+    const q = String(query).trim().toLowerCase();
+    if (!q) return [];
+    return items.filter(it => it.title.toLowerCase().includes(q)).slice(0, 10)
+        .map(it => ({ id: it.pageId, title: it.title }));
+}
+
+async function cinemaPlusPage(pageId) {
+    const res = await axios.get(CPLUS_GET_HTML.replace('%s', pageId), { headers: { 'User-Agent': CPLUS_UA }, timeout: 25000 });
+    const html = String(res.data || '');
+    const epM = html.match(/const\s+episodeLinks\s*=\s*\{(.*?)\}/s);
+    const episodeLinks = {};
+    if (epM) {
+        for (const mm of epM[1].matchAll(/"(\d+-\d+)":\s*"([^"]*)"/g)) episodeLinks[mm[1]] = mm[2];
+    }
+    const vsM = html.match(/const\s+videoSources\s*=\s*\{(.*?)\}/s);
+    const videoSources = {};
+    if (vsM) {
+        for (const mm of vsM[1].matchAll(/"([^"]+)":\s*"([^"]*)"/g)) {
+            if (mm[2] && mm[2].trim()) videoSources[mm[1]] = mm[2];
+        }
+    }
+    const isSeries = html.includes('const SERIES_ID') && Object.keys(episodeLinks).length > 0;
+    return { isSeries, episodeLinks, videoSources };
+}
+
+function cplusStreamUrl(src) {
+    if (!src) return null;
+    return /^https?:\/\//i.test(src) ? src : `https://stream.mux.com/${src}.m3u8`;
+}
+
+async function cinemaPlusEpisodes(pageId) {
+    const page = await cinemaPlusPage(pageId);
+    if (!page.isSeries) return [];
+    const keys = Object.keys(page.episodeLinks)
+        .filter(k => page.episodeLinks[k] && page.episodeLinks[k] !== '#')
+        .sort((a, b) => {
+            const [sa, ea] = a.split('-').map(Number);
+            const [sb, eb] = b.split('-').map(Number);
+            return (sa - sb) || (ea - eb);
+        });
+    return keys.map((k, i) => {
+        const [s, e] = k.split('-').map(Number);
+        return { id: `${pageId}:${k}`, number: i + 1, season: s, episode: e, title: `الموسم ${s} — الحلقة ${e}` };
+    });
+}
+
+async function cinemaPlusEpisodeLinks(pageId, key) {
+    const page = await cinemaPlusPage(pageId);
+    const src = page.episodeLinks[key];
+    const url = cplusStreamUrl(src);
+    if (!url) return [];
+    return [{ url, label: /m3u8/i.test(url) ? 'CinemaPlus — HLS' : 'CinemaPlus — MP4' }];
+}
+
+async function cinemaPlusMovieLinks(pageId) {
+    const page = await cinemaPlusPage(pageId);
+    const entries = Object.entries(page.videoSources);
+    if (!entries.length) return [];
+    const out = [];
+    // Mux أولاً (الأكثر ثباتاً)، ثم الروابط المباشرة
+    const sorted = entries.sort((a, b) => {
+        const aMux = !/^https?:\/\//i.test(a[1]) ? 0 : 1;
+        const bMux = !/^https?:\/\//i.test(b[1]) ? 0 : 1;
+        return aMux - bMux;
+    });
+    for (const [q, src] of sorted) {
+        const url = cplusStreamUrl(src);
+        if (!url) continue;
+        out.push({ url, label: `CinemaPlus — ${q}` });
+        if (out.length >= 6) break;
+    }
+    return out;
+}
+
+// ---------- VioLa (hq.vio-la.com) ----------
+const VIOLA_BASE = 'https://hq.vio-la.com';
+const VIOLA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+const VIOLA_HEADERS = { 'User-Agent': VIOLA_UA };
+const VK_CLIENT_ID = '52461373';
+const VK_SECRET = 'o557NLIkAErNhakXrQ7A';
+const VK_APP_ID = '6287487';
+let vkTokenCache = null;
+
+async function violaSearch(query) {
+    const html = await fetchText(`${VIOLA_BASE}/search.php?keywords=${encodeURIComponent(query)}&video-id=`, { headers: VIOLA_HEADERS });
+    const out = []; const seen = new Set();
+    const re = /<a[^>]+href="[^"]*watch\.php\?vid=([a-z0-9]+)[^"]*"[^>]*>/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+        const vid = m[1];
+        if (seen.has(vid)) continue;
+        seen.add(vid);
+        const tag = m[0];
+        let title = (tag.match(/title="([^"]+)"/) || [])[1] || '';
+        title = decodeHtmlEntities(title.trim());
+        if (!title) continue;
+        out.push({ id: vid, title });
+        if (out.length >= 10) break;
+    }
+    return out;
+}
+
+async function violaEpisodes(vid) {
+    const html = await fetchText(`${VIOLA_BASE}/watch.php?vid=${vid}`, { headers: VIOLA_HEADERS });
+    const eps = [];
+    // أقسام المواسم: div[id^=Season] — نقطّع الـ HTML بين بداية كل موسم والذي يليه (الـ div متداخلة)
+    const starts = [];
+    const re = /<div[^>]+id=["']?Season\d+["']?[^>]*>/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) starts.push(m.index);
+    for (let s = 0; s < starts.length; s++) {
+        const block = html.slice(starts[s], s + 1 < starts.length ? starts[s + 1] : undefined);
+        const aRe = /<a[^>]+href="[^"]*watch\.php\?vid=([a-z0-9]+)[^"]*"[^>]*>/gi;
+        let am; let countInSeason = 0;
+        while ((am = aRe.exec(block)) !== null) {
+            const epid = am[1];
+            const tag = am[0];
+            let t = (tag.match(/title="([^"]+)"/) || [])[1] || '';
+            t = decodeHtmlEntities(t.trim());
+            const numM = t.match(/الحلقة\s*([0-9\u0660-\u0669]+)/);
+            let epNum = null;
+            if (numM) epNum = parseInt(String(numM[1]).replace(/[\u0660-\u0669]/g, ch => String(ch.charCodeAt(0) - 0x660)), 10);
+            if (!epNum) epNum = ++countInSeason;
+            else countInSeason = epNum;
+            eps.push({ id: epid, number: eps.length + 1, season: s + 1, episode: epNum, title: t || `الموسم ${s + 1} — الحلقة ${epNum}` });
+        }
+    }
+    return eps;
+}
+
+// VK Video: توكن مجهول → video.get → ملفات mp4 + hls
+async function violaResolveVk(link) {
+    const oid = (String(link).match(/oid=(-?\d+)/) || [])[1];
+    const id = (String(link).match(/[?&]id=(\d+)/) || [])[1];
+    if (!oid || !id) return [];
+    if (!vkTokenCache) {
+        try {
+            const res = await axios.post('https://login.vk.ru?act=get_anonym_token',
+                new URLSearchParams({
+                    client_secret: VK_SECRET, client_id: VK_CLIENT_ID,
+                    scopes: 'audio_anonymous,video_anonymous,photos_anonymous,profile_anonymous',
+                    isApiOauthAnonymEnabled: 'false', version: '1', app_id: VK_APP_ID
+                }).toString(),
+                { headers: { 'User-Agent': VIOLA_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': 'https://vkvideo.ru', 'Referer': 'https://vkvideo.ru/' }, timeout: 20000 });
+            vkTokenCache = res.data && res.data.data && res.data.data.access_token;
+        } catch (_) { vkTokenCache = null; }
+        if (!vkTokenCache) return [];
+    }
+    try {
+        const res = await axios.post(`https://api.vkvideo.ru/method/video.get?v=5.289&client_id=${VK_CLIENT_ID}`,
+            new URLSearchParams({
+                owner_id: '', videos: `${oid}_${id}`, extended: '0', is_embed: 'true',
+                track_code: '', ref_domain: 'hq.vio-la.com', partner_name: '', access_token: vkTokenCache
+            }).toString(),
+            { headers: { 'User-Agent': VIOLA_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': 'https://vkvideo.ru', 'Referer': 'https://vkvideo.ru/' }, timeout: 20000, responseType: 'text' });
+        const dec = (typeof res.data === 'string' ? res.data : JSON.stringify(res.data || '')).replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+        const out = [];
+        const seenLabels = new Set();
+        for (const mm of dec.matchAll(/"(mp4_\d+|hls)"\s*:\s*"(https?[^"]+)"/g)) {
+            const q = mm[1] === 'hls' ? 'HLS' : mm[1].replace('mp4_', '') + 'p';
+            if (seenLabels.has(q)) continue;
+            seenLabels.add(q);
+            out.push({ url: mm[2], label: `VK — ${q}` });
+        }
+        // mp4 أولاً (روابط مباشرة)، ثم HLS
+        out.sort((a, b) => (a.label.includes('HLS') ? 1 : 0) - (b.label.includes('HLS') ? 1 : 0));
+        return out;
+    } catch (_) { return []; }
+}
+
+// سكريبر mawdhou3: GET {endpoint}?api={embed} → file:"url" (,label:"q")
+async function violaScrape(endpoint, link) {
+    try {
+        const res = await axios.get(endpoint + encodeURIComponent(link), { headers: { 'User-Agent': VIOLA_UA }, timeout: 20000 });
+        const out = [];
+        for (const mm of String(res.data || '').matchAll(/file:"(https[^"]+)"(?:\s*,\s*label:"([^"]*)")?/g)) {
+            out.push({ url: mm[1], label: mm[2] ? `Ult4vid — ${mm[2]}` : 'Ult4vid — MP4' });
+        }
+        return out;
+    } catch (_) { return []; }
+}
+
+async function violaEpisodeLinks(vid) {
+    const html = await fetchText(`${VIOLA_BASE}/play.php?vid=${vid}`, { headers: VIOLA_HEADERS });
+    const servers = [];
+    const seen = new Set();
+    for (const m of String(html).matchAll(/<li[^>]+data-embed[^>]*>/gi)) {
+        const srcM = m[0].match(/src='([^']+)'/);
+        if (!srcM || seen.has(srcM[1])) continue;
+        seen.add(srcM[1]);
+        servers.push({ link: srcM[1] });
+    }
+    const out = [];
+    for (const s of servers) {
+        try {
+            if (/youtube\.com/i.test(s.link)) continue;
+            if (/ok\.ru/i.test(s.link)) continue; // مشغّل JS حالياً — لا JSON ثابت
+            if (/vkvideo\.ru|vk\.com\/video_ext/i.test(s.link)) {
+                for (const r of await violaResolveVk(s.link)) out.push({ ...r, referer: 'https://hq.vio-la.com/' });
+            } else if (/71stream/i.test(s.link)) {
+                for (const r of await violaScrape('https://mawdhou3.com/scrapefinal/71stream.php?api=', s.link)) out.push({ ...r, referer: 'https://hq.vio-la.com/' });
+            } else if (/ult4vid/i.test(s.link)) {
+                for (const r of await violaScrape('https://mawdhou3.com/scrapefinal/ult4vid.php?api=', s.link)) out.push({ ...r, referer: 'https://hq.vio-la.com/' });
+            } else {
+                // محاولة أخيرة: mp4/m3u8 مباشر في صفحة الـ embed
+                try {
+                    const page = await fetchText(s.link, { headers: { ...VIOLA_HEADERS, Referer: 'https://hq.vio-la.com/' } });
+                    const mm = String(page).match(/https?:\/\/[^\s"'<>]+\.(mp4|m3u8)[^\s"'<>]*/i);
+                    if (mm) out.push({ url: mm[0], label: 'سيرفر — مباشر', referer: 'https://hq.vio-la.com/' });
+                } catch (_) {}
+            }
+        } catch (_) {}
+        if (out.length >= 6) break;
+    }
+    return out.slice(0, 6);
+}
+
+// ---------- حل روابط حلقة/فيلم من أي مصدر (أفلام ومسلسلات) ----------
+// ترجع {links: [{url, label, referer?}], subtitleUrl?: string}
+async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
+    if (source === 'akwam') {
+        const mp4s = await extractAkwamMp4Links(ep.id);
+        return { links: mp4s.map(u => ({ url: u, label: akwamQualityName(u), referer: 'https://akwam.ss/' })) };
+    }
+    if (source === 'cloudday') {
+        const base = await cloudDayResolveBase(CLOUDDAY_SOURCES.find(s => s.name === cdSource));
+        const links = await cloudDayServers(base, 'episode', ep.id);
+        return { links: await cloudDayResolveLinks(links) };
+    }
+    if (source === 'meowtv') {
+        const [tmdbId, s, e] = String(ep.id).split(':');
+        const links = await meowStreams(tmdbId, 'tv', s, e);
+        const subtitleUrl = await meowSubs(tmdbId, 'tv', s, e);
+        return { links, subtitleUrl };
+    }
+    if (source === 'cinemaplus') {
+        const [pageId, key] = String(ep.id).split(':');
+        return { links: await cinemaPlusEpisodeLinks(pageId, key) };
+    }
+    if (source === 'viola') return { links: await violaEpisodeLinks(ep.id) };
+    return { links: [] };
+}
+
+async function resolveMvMovieLinks(source, cdSource, id) {
+    if (source === 'akwam') {
+        const mp4s = await extractAkwamMp4Links(id);
+        return { links: mp4s.map(u => ({ url: u, label: akwamQualityName(u), referer: 'https://akwam.ss/' })) };
+    }
+    if (source === 'meowtv') {
+        const links = await meowStreams(id, 'movie');
+        const subtitleUrl = await meowSubs(id, 'movie');
+        return { links, subtitleUrl };
+    }
+    if (source === 'cinemaplus') return { links: await cinemaPlusMovieLinks(id) };
+    if (source === 'viola') return { links: await violaEpisodeLinks(id) };
+    return { links: [] };
+}
+
+// بحث مصدر واحد بالاسم (نفس دوال البحث — بلا تكرار كود)
+async function mvSearchOne(name, query, kind) {
+    const e = MV_SOURCE_NAMES[name];
+    if (!e) return [];
+    if (e.source === 'akwam') return await akwamSearch(query, kind);
+    if (e.source === 'cloudday') {
+        if (kind !== 'series') return []; // أفلام CloudDay فاشلة — لا تُعرض
+        return await cloudDaySearch(query, e.cdSource, '2');
+    }
+    if (e.source === 'meowtv') return await meowSearch(query, kind);
+    if (e.source === 'cinemaplus') return await cinemaPlusSearch(query);
+    if (e.source === 'viola') return await violaSearch(query);
+    return [];
+}
+
+// دمج ترجمة VTT عربية في ملف mp4 (مسار ترجمة قابل للاختيار) — best-effort، الفيديو يُرسل حتى لو فشل الدمج
+async function muxSubtitleIntoMp4(videoPath, vttUrl) {
+    try {
+        const tmpDir = path.join(process.cwd(), 'dltmp');
+        const vttPath = path.join(tmpDir, `sub_${randomBytes(4).toString('hex')}.vtt`);
+        const outPath = path.join(tmpDir, `vidsub_${randomBytes(4).toString('hex')}.mp4`);
+        const res = await axios.get(vttUrl, { responseType: 'arraybuffer', timeout: 30000, headers: { 'User-Agent': 'Mozilla/5.0', 'Origin': 'https://meowtv.ru', 'Referer': 'https://meowtv.ru/' } });
+        fs.writeFileSync(vttPath, Buffer.from(res.data));
+        const r = await runFfmpeg(['-y', '-i', videoPath, '-i', vttPath, '-c', 'copy', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=ar', outPath], null);
+        try { if (fs.existsSync(vttPath)) fs.unlinkSync(vttPath); } catch (_) {}
+        if (r && r.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+            try { if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath); } catch (_) {}
+            return outPath;
+        }
+        try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+        return videoPath;
+    } catch (_) { return videoPath; }
+}
+
 const buildZip = (files, outPath) => {
     const entries    = [];
     const centralDir = [];
@@ -2556,13 +3066,14 @@ async function startXeonBotInc() {
                             let ok = 0; const failedNums = [];
                             for (const item of cached.batch) {
                                 const link = item.links[Math.min(idx, item.links.length - 1)];
-                                const outPath = path.join(tmpDir, `vid_${randomBytes(4).toString('hex')}.mp4`);
+                                let outPath = path.join(tmpDir, `vid_${randomBytes(4).toString('hex')}.mp4`);
                                 try {
                                     await downloadVideoSmart(link.url, outPath, {
                                         'User-Agent': 'Mozilla/5.0',
                                         'Referer': item.referer || cached.referer || 'https://akwam.ss/',
                                         ...(cached.headers || {})
                                     });
+                                    if (item.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, item.subtitleUrl);
                                     const finalSizeMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
                                     await XeonBotInc.sendMessage(chatId, {
                                         document: { url: outPath },
@@ -2612,6 +3123,7 @@ async function startXeonBotInc() {
                                 'Referer': cached.referer || 'https://akwam.ss/',
                                 ...(cached.headers || {})
                             });
+                            if (cached.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, cached.subtitleUrl);
 
                             const finalSizeMB =
                             (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
@@ -3299,6 +3811,187 @@ async function startXeonBotInc() {
                             return;
                         }
                     }
+
+                    // ── اختيار فيلم/مسلسل/حلقة من نتائج .movie / .series (متعدد المصادر) ──
+                    if (mvCache.has(quotedId)) {
+                        const cachedData = mvCache.get(quotedId);
+                        const num = parseInt(String(replyText).trim());
+                        if (isNaN(num) || num < 1) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                            return;
+                        }
+
+                        // ── المرحلة 1: اختيار فيلم/مسلسل من نتائج البحث ──
+                        if (cachedData.stage === 'search') {
+                            const selected = cachedData.results[num - 1];
+                            if (!selected) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                                return;
+                            }
+                            mvCache.delete(quotedId);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ جاري جلب ${selected.type === 'movie' ? 'سيرفرات' : 'حلقات'} *${selected.title}*...`
+                            }, { quoted: mek });
+                            try {
+                                // فيلم مباشر (أو فيديو واحد) → الجودات مباشرة
+                                const direct = async () => {
+                                    const resolved = await resolveMvMovieLinks(selected.source, selected.cdSource, selected.id);
+                                    if (!resolved.links.length) throw new Error('لا توجد روابط تحميل متاحة.');
+                                    let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${selected.title}\n\n`;
+                                    resolved.links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
+                                    qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة.`;
+                                    const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                    qualityCache.set(sentQ.key.id, {
+                                        links: resolved.links.map(r => r.url),
+                                        names: resolved.links.map(r => r.label),
+                                        title: selected.title,
+                                        referer: (resolved.links[0] && resolved.links[0].referer) || '',
+                                        headers: selected.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {},
+                                        subtitleUrl: resolved.subtitleUrl || null,
+                                        timestamp: Date.now()
+                                    });
+                                    setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                                };
+
+                                // مسلسل → قائمة الحلقات
+                                const showEpisodes = async (episodes) => {
+                                    if (!episodes.length) throw new Error('لا توجد حلقات.');
+                                    let epText = `📺 *${selected.title}*\n🔢 عدد الحلقات: ${episodes.length}\n\n`;
+                                    episodes.slice(0, 10).forEach(e => {
+                                        epText += `*${e.number}* - ${e.title || ('الحلقة ' + e.number)}\n`;
+                                    });
+                                    if (episodes.length > 10) epText += `…\n`;
+                                    epText += `\n💡 رد (Reply) على هذه الرسالة برقم الحلقة، أو بمدى مثل 1-15 لتحميل عدة حلقات دفعة واحدة.`;
+                                    const sentEp = await XeonBotInc.sendMessage(chatId, { text: epText }, { quoted: mek });
+                                    mvCache.set(sentEp.key.id, {
+                                        stage: 'episodes', source: selected.source, cdSource: selected.cdSource,
+                                        mvId: selected.id, title: selected.title, episodes,
+                                        timestamp: Date.now()
+                                    });
+                                    setTimeout(() => mvCache.delete(sentEp.key.id), 300000);
+                                };
+
+                                if (selected.source === 'akwam') {
+                                    if (String(selected.id).includes('/movie/')) await direct();
+                                    else {
+                                        const html = await akwamFetch(selected.id);
+                                        await showEpisodes(extractAkwamEpisodes(html).map((u, i) => ({ id: u, number: i + 1, title: u.replace(/.*\/episode\//, '').replace(/-/g, ' ').replace(/\/$/, '') })));
+                                    }
+                                } else if (selected.source === 'cloudday') {
+                                    if (selected.type === 'movie') await direct();
+                                    else {
+                                        const base = await cloudDayResolveBase(CLOUDDAY_SOURCES.find(s => s.name === selected.cdSource));
+                                        await showEpisodes(await cloudDayEpisodes(base, selected.id));
+                                    }
+                                } else if (selected.source === 'meowtv') {
+                                    if (selected.type === 'movie') await direct();
+                                    else await showEpisodes(await meowEpisodes(selected.id));
+                                } else if (selected.source === 'cinemaplus') {
+                                    const page = await cinemaPlusPage(selected.id);
+                                    if (page.isSeries) await showEpisodes(await cinemaPlusEpisodes(selected.id));
+                                    else await direct();
+                                } else if (selected.source === 'viola') {
+                                    const eps = await violaEpisodes(selected.id);
+                                    if (eps.length) await showEpisodes(eps);
+                                    else await direct();
+                                } else {
+                                    throw new Error('مصدر غير معروف.');
+                                }
+                            } catch (err) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ فشل الجلب:\n\`${err.message}\``
+                                }, { quoted: mek });
+                            }
+                            return;
+                        }
+
+                        // ── المرحلة 2: اختيار الحلقة (أو مدى حلقات مثل 1-15) ──
+                        if (cachedData.stage === 'episodes') {
+                            // ── تحميل مدى حلقات ──
+                            const rangeMatch = String(replyText).trim().match(/^(\d+)\s*-\s*(\d+)$/);
+                            if (rangeMatch) {
+                                const start = parseInt(rangeMatch[1], 10);
+                                const end = parseInt(rangeMatch[2], 10);
+                                const total = cachedData.episodes.length;
+                                if (start < 1 || end < start || end > total || (end - start + 1) > 20) {
+                                    await XeonBotInc.sendMessage(chatId, { text: `❌ مدى غير صحيح. اكتب مدى مثل 1-15 (بحد أقصى 20 حلقة، والمسلسل فيه ${total} حلقة).` }, { quoted: mek });
+                                    return;
+                                }
+                                const wanted = cachedData.episodes.filter(e => e.number >= start && e.number <= end).sort((a, b) => a.number - b.number);
+                                if (!wanted.length) {
+                                    await XeonBotInc.sendMessage(chatId, { text: '❌ لا توجد حلقات في هذا المدى.' }, { quoted: mek });
+                                    return;
+                                }
+                                mvCache.delete(quotedId);
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `⏳ جاري جلب سيرفرات الحلقات ${start}-${end} (${wanted.length} حلقة)...`
+                                }, { quoted: mek });
+                                try {
+                                    const batch = [];
+                                    const failedNums = [];
+                                    for (const ep of wanted) {
+                                        try {
+                                            const resolved = await resolveMvEpisodeLinks(cachedData.source, cachedData.cdSource, cachedData.mvId, ep);
+                                            if (resolved.links.length) batch.push({ number: ep.number, links: resolved.links, referer: (resolved.links[0] && resolved.links[0].referer) || '', subtitleUrl: resolved.subtitleUrl || null });
+                                            else failedNums.push(ep.number);
+                                        } catch (_) { failedNums.push(ep.number); }
+                                    }
+                                    if (!batch.length) throw new Error('لا توجد روابط تحميل متاحة لأي حلقة في هذا المدى.');
+                                    let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${cachedData.title} — الحلقات ${start}-${end} (${batch.length} حلقة جاهزة${failedNums.length ? `، فشلت: ${failedNums.join('، ')}` : ''})\n\n`;
+                                    batch[0].links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
+                                    qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة، وسيتم تحميل كل الحلقات بنفس الجودة.`;
+                                    const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                    qualityCache.set(sentQ.key.id, {
+                                        links: batch[0].links.map(r => r.url),
+                                        names: batch[0].links.map(r => r.label),
+                                        title: `${cachedData.title} - الحلقات ${start}-${end}`,
+                                        referer: batch[0].referer,
+                                        headers: cachedData.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {},
+                                        batch: batch.map(b => ({ number: b.number, links: b.links, referer: b.referer, subtitleUrl: b.subtitleUrl })),
+                                        timestamp: Date.now()
+                                    });
+                                    setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                                } catch (err) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `❌ فشل جلب السيرفرات:\n\`${err.message}\``
+                                    }, { quoted: mek });
+                                }
+                                return;
+                            }
+                            const ep = cachedData.episodes.find(e => e.number === num);
+                            if (!ep) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم حلقة غير صحيح.' }, { quoted: mek });
+                                return;
+                            }
+                            mvCache.delete(quotedId);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ جاري جلب سيرفرات الحلقة ${ep.number}...`
+                            }, { quoted: mek });
+                            try {
+                                const resolved = await resolveMvEpisodeLinks(cachedData.source, cachedData.cdSource, cachedData.mvId, ep);
+                                if (!resolved.links.length) throw new Error('لا توجد روابط تحميل متاحة لهذه الحلقة.');
+                                let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${cachedData.title} — الحلقة ${ep.number}\n\n`;
+                                resolved.links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
+                                qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة.`;
+                                const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                qualityCache.set(sentQ.key.id, {
+                                    links: resolved.links.map(r => r.url),
+                                    names: resolved.links.map(r => r.label),
+                                    title: `${cachedData.title} - الحلقة ${ep.number}`,
+                                    referer: (resolved.links[0] && resolved.links[0].referer) || '',
+                                    headers: cachedData.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {},
+                                    subtitleUrl: resolved.subtitleUrl || null,
+                                    timestamp: Date.now()
+                                });
+                                setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                            } catch (err) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ فشل جلب السيرفرات:\n\`${err.message}\``
+                                }, { quoted: mek });
+                            }
+                            return;
+                        }
+                    }
                 }
 
                 // ============================================================
@@ -3325,6 +4018,8 @@ async function startXeonBotInc() {
                     text.startsWith('.series') ||
                     text.startsWith('.manga') ||
                     text.startsWith('.movie') ||
+                    text.startsWith('.setmv') ||
+                    text.startsWith('.mvapi') ||
                     text.startsWith('.test') ||
                     text.startsWith('.seturl') ||
                     text.startsWith('.channels') ||
@@ -5206,39 +5901,131 @@ async function startXeonBotInc() {
                         return;
                     }
 
-                    // ── أمر .series (akwam.ss) ──
-                    if (command === '.series') {
+                    // ── أمر .setmv (تثبيت مصدر واحد لـ .movie / .series) ──
+                    if (command === '.setmv') {
+                        const name = query.toLowerCase().trim();
+                        const namesList = MV_SOURCE_LIST.join('، ');
+                        if (!name) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: mvLockedSource
+                                    ? `📌 المصدر المثبّت حالياً: *${MV_SOURCE_NAMES[mvLockedSource].label}*\n\n💡 للتبديل: \`.setmv <اسم المصدر>\`\nللرجوع لكل المصادر: \`.setmv all\`\n\nالمصادر المتاحة: ${namesList}`
+                                    : `📌 لا يوجد مصدر مثبّت — البحث في كل المصادر.\n\n💡 للتثبيت على مصدر واحد: \`.setmv <اسم المصدر>\`\n\nالمصادر المتاحة: ${namesList}`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        if (name === 'all' || name === 'off' || name === 'none' || name === 'الكل') {
+                            mvLockedSource = null;
+                            await XeonBotInc.sendMessage(chatId, { text: '✅ تم الرجوع للبحث في كل المصادر.' }, { quoted: mek });
+                            return;
+                        }
+                        if (!MV_SOURCE_NAMES[name]) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ مصدر غير معروف: *${name}*\n\nالمصادر المتاحة: ${namesList}` }, { quoted: mek });
+                            return;
+                        }
+                        mvLockedSource = name;
+                        await XeonBotInc.sendMessage(chatId, { text: `✅ تم تثبيت مصدر الأفلام/المسلسلات على: *${MV_SOURCE_NAMES[name].label}*\n\n🔍 أمرا .movie و .series سيبحثان فيه فقط الآن. عند وقوعه، بدّله بأمر \`.setmv <مصدر آخر>\` أو ارجع للكل بـ \`.setmv all\`.` }, { quoted: mek });
+                        return;
+                    }
+
+                    // ── أمر .movie / .series (بحث أفلام ومسلسلات عبر 5 مصادر) ──
+                    if (command === '.movie' || command === '.series') {
+                        const kind = command === '.movie' ? 'movie' : 'series';
+                        const kindAr = kind === 'movie' ? 'الفيلم' : 'المسلسل';
                         if (!query) {
                             await XeonBotInc.sendMessage(chatId, {
-                                text: '❌ يرجى كتابة اسم المسلسل.\n💡 *مثال:* `.series breaking bad`\nأو: `.series مسلسل عربي`'
+                                text: `❌ يرجى كتابة اسم ${kindAr}.\n💡 *مثال:* \`${command} breaking bad\``
                             }, { quoted: mek });
                             return;
                         }
                         try {
+                            const locked = mvLockedSource ? MV_SOURCE_NAMES[mvLockedSource] : null;
                             await XeonBotInc.sendMessage(chatId, {
-                                text: `🔍 جاري البحث عن *${query}* في akwam.ss...`
+                                text: locked
+                                    ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
+                                    : `🔍 جاري البحث عن *${query}* في 5 مصادر...`
                             }, { quoted: mek });
 
-                            const html = await akwamFetch(`https://akwam.ss/search?q=${encodeURIComponent(query)}`);
-                            const results = extractAkwamSeries(html);
+                            const results = [];
+                            const seenTitles = new Set();
+                            const addResults = (source, cdSource, list, max) => {
+                                for (const it of (Array.isArray(list) ? list : []).slice(0, max)) {
+                                    const key = String(it.title || '').trim().toLowerCase();
+                                    if (!key || seenTitles.has(key)) continue;
+                                    seenTitles.add(key);
+                                    results.push({ source, cdSource, id: it.id, type: it.type || 'series', title: it.title });
+                                }
+                            };
+                            if (locked) {
+                                // مصدر واحد مثبّت عبر .setmv — نفس الكود، مصدر واحد فقط
+                                const list = await mvSearchOne(mvLockedSource, query, kind);
+                                addResults(locked.source, locked.cdSource, list, 10);
+                            } else {
+                                // بحث متوازي في المصادر الخمسة — فشل مصدر لا يوقف الباقي
+                                const [akwam, cdCloud, meow, cplus, viola] = await Promise.allSettled([
+                                    akwamSearch(query, kind),
+                                    kind === 'series' ? cloudDaySearch(query, 'CimaCloud', '2') : Promise.resolve([]),
+                                    meowSearch(query, kind),
+                                    cinemaPlusSearch(query),
+                                    violaSearch(query)
+                                ]);
+                                if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 3);
+                                if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
+                                if (meow.status === 'fulfilled') addResults('meowtv', null, meow.value, 3);
+                                if (cplus.status === 'fulfilled') addResults('cinemaplus', null, cplus.value, 2);
+                                if (viola.status === 'fulfilled') addResults('viola', null, viola.value, 2);
+                            }
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : 'لم يتم العثور على أي نتائج في المصادر الخمسة. جرّب اسماً مختلفاً.');
 
-                            if (results.length === 0) throw new Error('لم يتم العثور على مسلسلات مطابقة. جرّب اسماً مختلفاً.');
-
-                            let resText = `📺 *نتائج البحث في akwam.ss:*\n\n`;
-                            results.slice(0, 12).forEach((s, i) => {
-                                resText += `*${i + 1}* - ${s.name}\n`;
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : '🎭 VioLa';
+                            let responseText = kind === 'movie' ? `🎬 *نتائج البحث (أفلام):*\n\n` : `📺 *نتائج البحث (مسلسلات):*\n\n`;
+                            results.slice(0, 15).forEach((r, index) => {
+                                responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
                             });
-                            resText += `\n💡 **رد (Reply)** على هذه الرسالة برقم المسلسل المطلوب.`;
+                            responseText += `\n💡 *طريقة الاختيار:*\nقم **بالرد (Reply)** على هذه الرسالة برقم ${kindAr} المطلوب.\n\n🍿 *مثال:* \`1\``;
 
-                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: resText }, { quoted: mek });
-                            akwamCache.set(sentMsg.key.id, {
-                                stage: 'series_list',
-                                results: results.slice(0, 12),
+                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                            mvCache.set(sentMsg.key.id, {
+                                stage: 'search',
+                                results: results.slice(0, 15),
                                 timestamp: Date.now()
                             });
-                            setTimeout(() => akwamCache.delete(sentMsg.key.id), 300000);
+                            setTimeout(() => mvCache.delete(sentMsg.key.id), 300000);
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .mvapi (فحص حالة مصادر الأفلام والمسلسلات) ──
+                    if (command === '.mvapi') {
+                        try {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '🔍 جاري فحص مصادر الأفلام والمسلسلات...'
+                            }, { quoted: mek });
+                            const probes = [
+                                { name: '📺 Akwam', fn: async () => { const r = await akwamSearch('breaking', 'series'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '☁️ CloudDay (CimaCloud)', fn: async () => { const r = await cloudDaySearch('breaking bad', 'CimaCloud', '2'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🐱 MeowTv', fn: async () => { const r = await meowSearch('breaking bad', 'series'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎬 CinemaPlus', fn: async () => { const r = await cinemaPlusSearch('one piece'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎭 VioLa', fn: async () => { const r = await violaSearch('breaking bad'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                            ];
+                            const settled = await Promise.allSettled(probes.map(async p => {
+                                const t = Date.now();
+                                const n = await p.fn();
+                                return { name: p.name, ms: Date.now() - t, n };
+                            }));
+                            let out = `📊 *حالة مصادر الأفلام والمسلسلات:*\n\n`;
+                            settled.forEach((s, i) => {
+                                if (s.status === 'fulfilled') {
+                                    out += `🟢 *${s.value.name}* — شغال (${s.value.ms}ms، ${s.value.n} نتيجة)\n`;
+                                } else {
+                                    out += `🔴 *${probes[i].name}* — متوقف (${String((s.reason && s.reason.message) || 'خطأ').slice(0, 80)})\n`;
+                                }
+                            });
+                            out += `\n🕐 ${new Date().toLocaleString('ar-EG', { timeZone: 'Africa/Cairo' })}`;
+                            await XeonBotInc.sendMessage(chatId, { text: out }, { quoted: mek });
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل الفحص:\n\`${err.message}\`` }, { quoted: mek });
                         }
                         return;
                     }
