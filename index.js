@@ -5098,6 +5098,9 @@ async function startXeonBotInc() {
                     text.startsWith('.cartoon') ||
                     text.startsWith('.setcartoon') ||
                     text.startsWith('.cartoonapi') ||
+                    text.startsWith('.kdrama') ||
+                    text.startsWith('.setkdrama') ||
+                    text.startsWith('.kdramaapi') ||
                     text.startsWith('.series') ||
                     text.startsWith('.manga') ||
                     text.startsWith('.movie') ||
