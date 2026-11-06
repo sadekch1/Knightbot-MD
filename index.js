@@ -550,7 +550,7 @@ const qualityCache = new Map();
 
 // ── تثبيت مصدر واحد لـ .anime (عبر .setanime / .animeset) ──
 let animeLockedSource = null; // null = البحث في كل المصادر
-const ANIME_SOURCE_LIST = ['animeday', 'cimacloud', 'rift', 'witcher', 'shahiid', 'anime4up', 'animedar', 'kartoney', 'animerco', 'hianime', 'okru'];
+const ANIME_SOURCE_LIST = ['animeday', 'cimacloud', 'rift', 'witcher', 'shahiid', 'anime4up', 'animedar', 'kartoney', 'animerco', 'hianime', 'okru', 'arabanime', 'animezid', 'okanime', 'egyaflam'];
 const ANIME_SOURCE_NAMES = {
     animeday: { source: 'cloudday', cdSource: 'AnimeDay', label: '☁️ CloudDay (AnimeDay)' },
     cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
@@ -564,7 +564,11 @@ const ANIME_SOURCE_NAMES = {
     kartoney: { source: 'kartoney', cdSource: null, label: '🧒 Kartoney' },
     animerco: { source: 'animerco', cdSource: null, label: '🎭 Animerco' },
     hianime: { source: 'hianime', cdSource: null, label: '🌍 HiAnime EN' },
-    okru: { source: 'okru', cdSource: null, label: '📺 ok.ru' }
+    okru: { source: 'okru', cdSource: null, label: '📺 ok.ru' },
+    arabanime: { source: 'arabanime', cdSource: null, label: '🌸 ArabAnime' },
+    animezid: { source: 'animezid', cdSource: null, label: '🌟 AnimeZid' },
+    okanime: { source: 'okanime', cdSource: null, label: '🎬 OkAnime' },
+    egyaflam: { source: 'egyaflam', cdSource: null, label: '🎞️ EgyAflam' }
 };
 
 // بحث مصدر واحد بالاسم (نفس دوال البحث — بلا تكرار كود)
@@ -581,6 +585,10 @@ async function animeSearchOne(name, query) {
     if (e.source === 'animerco') return await animercoSearch(query);
     if (e.source === 'hianime') return await hianimeSearch(query);
     if (e.source === 'okru') return (await okruSearchAnime(query)).map(v => ({ id: v.id, title: v.title }));
+    if (e.source === 'arabanime') return await arabanimeSearch(query);
+    if (e.source === 'animezid') return await animezidSearch(query);
+    if (e.source === 'okanime') return await okanimeSearch(query);
+    if (e.source === 'egyaflam') return await egyaflamSearch(query);
     return [];
 }
 const akwamCache = new Map();
@@ -834,11 +842,12 @@ async function downloadHlsSegments(url, outPath, headers = {}) {
 
 async function downloadVideoSmart(url, outPath, headers = {}) {
     if (isHlsUrl(url)) {
+        // ffmpeg بياخد آخر -headers بس — اجمع كل الهيدرات في وسيط واحد مفصول بـ CRLF
+        const hdrs = Object.entries(headers || {})
+            .filter(([k, v]) => !/^:/.test(k) && v !== undefined && v !== null)
+            .map(([k, v]) => `${k}: ${v}`).join('\r\n');
         const args = [];
-        for (const [k, v] of Object.entries(headers || {})) {
-            if (/^:/.test(k) || v === undefined || v === null) continue;
-            args.push('-headers', `${k}: ${v}`);
-        }
+        if (hdrs) args.push('-headers', hdrs);
         args.push('-i', url, '-c', 'copy', '-y', outPath);
         const res = await runFfmpeg(args, null);
         if (res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return;
@@ -855,7 +864,7 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
     try {
         response = await axios({
             method: 'GET', url, responseType: 'stream', timeout: 1800000,
-            headers: { 'User-Agent': 'Mozilla/5.0', ...headers }
+            headers: { 'User-Agent': WEB_UA, ...headers }
         });
     } catch (err) {
         // بعض سيرفرات الفيديو شهادتها مكسورة (سلسلة ناقصة) — أعد المحاولة بدون التحقق من الشهادة
@@ -866,7 +875,7 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         if (!isCertErr) throw err;
         response = await axios({
             method: 'GET', url, responseType: 'stream', timeout: 1800000,
-            headers: { 'User-Agent': 'Mozilla/5.0', ...headers },
+            headers: { 'User-Agent': WEB_UA, ...headers },
             httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
         });
     }
@@ -878,6 +887,11 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         writer.on('error', reject);
         response.data.on('error', reject);
     });
+    // ملف فارغ = السيرفر لم يرسل بيانات — لا ترسله كأنه تحميل ناجح
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
+        try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+        throw new Error('التحميل رجّع ملفاً فارغاً (السيرفر لم يرسل بيانات).');
+    }
 }
 
 // ============================================================
@@ -1317,7 +1331,14 @@ async function shahiidEpisodeLinks(episodeUrl) {
             const ajaxHtml = await fetchTextPost(`${SHAHIID_BASE}/wp-admin/admin-ajax.php`,
                 { action: 'codecanal_ajax_request', post: s.post, serv: s.serv, frameserver: s.fs, _server_code_: '', is_film: '' },
                 { headers: { Referer: episodeUrl } });
-            const src = (String(ajaxHtml).match(/<iframe[^>]*src="([^"]+)"/i) || [])[1];
+            let src = (String(ajaxHtml).match(/<iframe[^>]*src="([^"]+)"/i) || [])[1];
+            if (!src) {
+                // بعض الأزرار (مثل Megamax) تحتاج GET بدل POST
+                try {
+                    const getHtml = await fetchText(`${SHAHIID_BASE}/wp-admin/admin-ajax.php?action=codecanal_ajax_request&post=${encodeURIComponent(s.post)}&frameserver=${encodeURIComponent(s.fs)}`, { headers: { Referer: episodeUrl } });
+                    src = (String(getHtml).match(/<iframe[^>]*src="([^"]+)"/i) || [])[1];
+                } catch (_) {}
+            }
             if (!src) continue;
             const mp4 = src.match(/mp4upload\.com\/embed-([^\.\/]+)\.html/i);
             if (mp4) { out.push({ url: await extractMp4uploadMp4(mp4[1]), label: 'Mp4upload — HD' }); continue; }
@@ -1325,6 +1346,15 @@ async function shahiidEpisodeLinks(episodeUrl) {
             if (ok) {
                 const { videos } = await extractOkruVideo(`https://ok.ru/video/${ok[1]}`);
                 for (const v of videos.slice(0, 2)) out.push({ url: v.url, label: 'ok.ru — ' + (OKRU_QUALITY_LABELS[v.name] || v.name) });
+                continue;
+            }
+            // Megamax (share4max) — البديل الشغال بعد موت Mp4upload (403)
+            const mega = src.match(/(?:share4max\.com|megamax\.me)\/iframe\/([A-Za-z0-9]+)/i);
+            if (mega) {
+                try {
+                    const streams = await megaMaxStreams(src, episodeUrl);
+                    for (const l of await megaMaxLinks(streams, 'شهيد — Megamax')) out.push(l);
+                } catch (_) {}
                 continue;
             }
         } catch (_) {}
@@ -1785,6 +1815,9 @@ async function resolveAnimeEpisodeLinks(source, cdSource, animeId, ep) {
     if (source === 'animezid') return await animezidEpisodeLinks(ep);
     if (source === 'animerco') return await animercoEpisodeLinks(ep.id);
     if (source === 'hianime') return await hianimeEpisodeLinks(animeId, ep);
+    if (source === 'arabanime') return await arabanimeEpisodeLinks(ep);
+    if (source === 'okanime') return await okanimeEpisodeLinks(ep);
+    if (source === 'egyaflam') return await egyaflamEpisodeLinks(ep.id);
     return [];
 }
 
@@ -2192,6 +2225,263 @@ async function animezidEpisodeLinks(ep) {
     }
     if (!links.length) throw new Error('لا توجد روابط تحميل متاحة لهذه الحلقة (كل السيرفرات ميتة حالياً).');
     return links;
+}
+
+// ============================================================
+// v108 — دوال جديدة: MegaMax المشترك + ArabAnime + okanime + EgyAflam
+// ============================================================
+
+// ---------- MegaMax / share4max (مشترك: animezid + okanime + shahiid) ----------
+// iframe (share4max/megamax.me) → streams (جودات + مرايا) عبر طلب Inertia الجزئي
+async function megaMaxStreams(iframeUrl, referer) {
+    const page = await axios.get(iframeUrl, { headers: { 'User-Agent': AZ_UA, 'Referer': referer || iframeUrl }, timeout: 20000, responseType: 'text' });
+    const appM = String(page.data || '').match(/<script[^>]*data-page="app"[^>]*>([\s\S]*?)<\/script>/);
+    if (!appM) throw new Error('لم يتم العثور على بيانات MegaMax.');
+    const app = JSON.parse(appM[1]);
+    const partial = await axios.get(iframeUrl, {
+        headers: { 'User-Agent': AZ_UA, 'X-Inertia': 'true', 'X-Inertia-Version': app.version, 'X-Inertia-Partial-Component': 'files/mirror/video', 'X-Inertia-Partial-Data': 'streams', 'Referer': referer || iframeUrl },
+        timeout: 20000, responseType: 'text'
+    });
+    const pdata = JSON.parse(partial.data);
+    return (pdata.props && pdata.props.streams && pdata.props.streams.data) || [];
+}
+
+// streams من MegaMax → روابط تحميل (mp4upload mp4 + uqload m3u8 + lulustream m3u8)
+async function megaMaxLinks(streams, labelPrefix) {
+    const links = [];
+    for (const st of streams) {
+        const mp4 = (st.mirrors || []).find(m => m.driver === 'mp4upload');
+        if (mp4) {
+            try {
+                const embUrl = mp4.link.startsWith('http') ? mp4.link : 'https:' + mp4.link;
+                const emb = await axios.get(embUrl, { headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text' });
+                const mm = String(emb.data || '').match(/player\.src\(\{\s*type:\s*"video\/mp4",\s*src:\s*"(https:\/\/a\d+\.mp4upload\.com:183\/d\/[^"]+\/video\.mp4)"/);
+                if (mm) links.push({ url: mm[1], label: `${labelPrefix} — ${st.label} (mp4upload)`, referer: embUrl });
+            } catch (_) {}
+        }
+        const uqm = (st.mirrors || []).find(m => m.driver === 'uqload');
+        if (uqm) {
+            try {
+                const embUrl = uqm.link.startsWith('http') ? uqm.link : 'https:' + uqm.link;
+                const m3u8 = await extractUqloadM3u8(embUrl);
+                const plRes = await axios.get(m3u8, { headers: { 'User-Agent': AZ_UA }, timeout: 20000, responseType: 'text' });
+                const variants = parseM3u8Variants(String(plRes.data || ''), m3u8);
+                if (variants.length) {
+                    for (const v of variants) links.push({ url: v.url, label: `${labelPrefix} — ${st.label} ${v.label} (Uqload)`, referer: 'https://uqload.com/' });
+                } else {
+                    links.push({ url: m3u8, label: `${labelPrefix} — ${st.label} (Uqload)`, referer: 'https://uqload.com/' });
+                }
+            } catch (_) {}
+        }
+        const lulu = (st.mirrors || []).find(m => /lulu/i.test(m.driver || ''));
+        if (lulu) {
+            try {
+                const embUrl = lulu.link.startsWith('http') ? lulu.link : 'https:' + lulu.link;
+                const m3u8 = await extractLuluM3u8(embUrl);
+                links.push({ url: m3u8, label: `${labelPrefix} — ${st.label} (LuluStream)`, referer: embUrl });
+            } catch (_) {}
+        }
+    }
+    return links;
+}
+
+// LuluStream: صفحة التضمين ← JS مضغوط ← m3u8 (Referer صفحة التضمين؛ إعادة بالكوكيز لو رفض)
+async function extractLuluM3u8(embedUrl) {
+    const clean = u => String(u || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    const res = await axios.get(embedUrl, { headers: { 'User-Agent': AZ_UA, 'Referer': embedUrl }, timeout: 20000, responseType: 'text' });
+    const cookies = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+    let src = deanEdwardsUnpack(String(res.data || '')) || String(res.data || '');
+    let m = src.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+    if (m) return clean(m[0]);
+    if (cookies) {
+        const res2 = await axios.get(embedUrl, { headers: { 'User-Agent': AZ_UA, 'Referer': embedUrl, 'Cookie': cookies }, timeout: 20000, responseType: 'text' });
+        src = deanEdwardsUnpack(String(res2.data || '')) || String(res2.data || '');
+        m = src.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+        if (m) return clean(m[0]);
+    }
+    throw new Error('لم يتم العثور على رابط m3u8 في LuluStream.');
+}
+
+// ---------- ArabAnime (arabanime.net — mp4 مباشر على server.sanime.net) ----------
+// البحث API يعمل بـ axios عادي؛ العرض والحلقات بيانات base64 في الصفحة؛
+// الرابط المباشر = https://server.sanime.net/Video3/{anime_id}/{episode_number}.mp4
+// تم التحقق 2026-11-06: ناروتو شيبودن ح1 193,625,987 بايت، 1450.6 ثانية
+const ARABANIME_API = 'https://www.arabanime.net';
+const ARABANIME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+function arabanimeDecodeB64(s) {
+    return JSON.parse(Buffer.from(String(s || ''), 'base64').toString('utf-8'));
+}
+
+async function arabanimeSearch(query) {
+    const res = await axios.get(`${ARABANIME_API}/api/search`, {
+        params: { q: query },
+        headers: { 'User-Agent': ARABANIME_UA }, timeout: 20000
+    });
+    const list = (res.data && res.data.SearchResaults) || [];
+    return list.map(x => {
+        try {
+            const d = arabanimeDecodeB64(x);
+            return { id: `${d.anime_id}:${d.anime_slug}`, title: d.anime_name, type: /movie|ova/i.test(d.anime_type || '') ? 'movie' : 'series' };
+        } catch (_) { return null; }
+    }).filter(Boolean).slice(0, 5);
+}
+
+async function arabanimeEpisodes(animeId) {
+    const [id, slug] = String(animeId || '').split(':');
+    if (!id) throw new Error('معرّف أنمي غير صالح.');
+    const res = await axios.get(`${ARABANIME_API}/show-${id}/${slug || ''}`, {
+        headers: { 'User-Agent': ARABANIME_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const m = html.match(/[A-Za-z0-9+/=]{500,}/);
+    if (!m) throw new Error('لم يتم العثور على بيانات الحلقات.');
+    const data = arabanimeDecodeB64(m[0]);
+    const eps = (data.EPS || []).map(e => ({
+        id: `${id}:${e.episode_number}`,
+        number: parseInt(e.episode_number, 10) || 0,
+        title: e.episode_name || `الحلقة ${e.episode_number}`,
+        animeId: String(id)
+    })).filter(e => e.number > 0);
+    eps.sort((a, b) => a.number - b.number);
+    if (!eps.length) throw new Error('لا توجد حلقات.');
+    return eps;
+}
+
+async function arabanimeEpisodeLinks(ep) {
+    const url = `https://server.sanime.net/Video3/${ep.animeId}/${ep.number}.mp4`;
+    try {
+        const h = await axios.head(url, { headers: { 'User-Agent': ARABANIME_UA }, timeout: 15000, maxRedirects: 3 });
+        const len = parseInt(h.headers['content-length'] || '0', 10);
+        if (h.status >= 400 || len < 1000000) throw new Error('ملف غير صالح');
+    } catch (e) {
+        throw new Error('رابط ArabAnime غير متاح لهذه الحلقة.');
+    }
+    return [{ url, label: 'ArabAnime — MP4', referer: '' }];
+}
+
+// ---------- okanime (ww3.okanime.xyz — MegaMax ← mp4upload) ----------
+// تم التحقق: ناروتو شيبودن ح1 170,831,185 بايت، 1388.3 ثانية، 720p
+// ملحوظة: ناروتو الكلاسيكي غير موجود (شيبودن وبوروتو والأفلام فقط)
+const OKANIME_API = 'https://ww3.okanime.xyz';
+const OKANIME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function okanimeSearch(query) {
+    const res = await axios.get(`${OKANIME_API}/anime-list`, {
+        params: { q: query },
+        headers: { 'User-Agent': OKANIME_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const out = []; const seen = new Set();
+    for (const m of html.matchAll(/<a[^>]*href="(?:https?:\/\/ww3\.okanime\.xyz)?\/anime\/([^"\/\?]+)"[^>]*>([\s\S]{0,200}?)<\/a>/g)) {
+        const slug = decodeURIComponent(m[1]);
+        if (seen.has(slug)) continue;
+        seen.add(slug);
+        let title = m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!title) title = slug.replace(/-/g, ' ');
+        out.push({ id: slug, title });
+    }
+    return out.slice(0, 5);
+}
+
+async function okanimeEpisodes(slug) {
+    const res = await axios.get(`${OKANIME_API}/anime/${encodeURIComponent(slug)}`, {
+        headers: { 'User-Agent': OKANIME_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const eps = []; const seen = new Set();
+    const esc = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`href="(?:https?:\\/\\/ww3\\.okanime\\.xyz)?\\/episode\\/(${esc}-episode-(\\d+))\\/?"`, 'g');
+    let m;
+    while ((m = re.exec(html)) !== null) {
+        const epSlug = m[1];
+        const num = parseInt(m[2], 10);
+        if (seen.has(num)) continue;
+        seen.add(num);
+        eps.push({ id: epSlug, number: num, title: `الحلقة ${num}` });
+    }
+    eps.sort((a, b) => a.number - b.number);
+    if (!eps.length) throw new Error('لا توجد حلقات.');
+    return eps;
+}
+
+async function okanimeEpisodeLinks(ep) {
+    const res = await axios.get(`${OKANIME_API}/episode/${encodeURIComponent(ep.id)}`, {
+        headers: { 'User-Agent': OKANIME_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const iframe = (html.match(/https?:\/\/(?:www\.)?(?:share4max\.com|megamax\.me)\/iframe\/[A-Za-z0-9]+/i) || [])[0];
+    if (iframe) {
+        const streams = await megaMaxStreams(iframe, `${OKANIME_API}/episode/${encodeURIComponent(ep.id)}`);
+        const links = await megaMaxLinks(streams, 'OkAnime');
+        if (links.length) return links;
+    }
+    // احتياطي: تضمين mp4upload مباشر في الصفحة
+    const mp4 = (html.match(/mp4upload\.com\/embed-([^\.\/"']+)\.html/i) || [])[1];
+    if (mp4) {
+        try { return [{ url: await extractMp4uploadMp4(mp4), label: 'OkAnime — MP4 (mp4upload)', referer: `https://www.mp4upload.com/embed-${mp4}.html` }]; } catch (_) {}
+    }
+    throw new Error('لا توجد روابط تحميل متاحة لهذه الحلقة.');
+}
+
+// ---------- EgyAflam (egyaflam.com — DooPlay + vidspeed HLS) ----------
+// البحث يرجّع حلقات منفردة بلا صفحة مسلسل — الاختيار يذهب للجودات فوراً
+// تم التحقق: ناروتو شيبودن ح1 74,408,110 بايت، 1384.6 ثانية، 480p
+const EGYAFLAM_BASE = 'https://egyaflam.com';
+const EGYAFLAM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function egyaflamSearch(query) {
+    const res = await axios.get(`${EGYAFLAM_BASE}/`, {
+        params: { s: query },
+        headers: { 'User-Agent': EGYAFLAM_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const out = []; const seen = new Set();
+    for (const m of html.matchAll(/<a[^>]*href="(https:\/\/egyaflam\.com\/watch\/[^"\/]+\/?)"[^>]*>([\s\S]{0,400}?)<\/a>/g)) {
+        const url = m[1];
+        if (seen.has(url)) continue;
+        seen.add(url);
+        // العنوان الحقيقي في alt الصورة (نص الرابط نفسه مجرد كلمة "مسلسل")
+        const alt = (m[2].match(/alt="([^"]{3,160})"/) || [])[1];
+        let title = alt ? decodeHtmlEntities(alt).trim()
+            : m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!title || title === 'مسلسل') {
+            try { title = decodeURIComponent(url.replace(/.*\/watch\//, '').replace(/\/$/, '')).replace(/-/g, ' '); } catch (_) { title = ''; }
+        }
+        if (!title) continue;
+        out.push({ id: url, title });
+    }
+    return out.slice(0, 5);
+}
+
+async function extractVidspeedM3u8(embedUrl) {
+    const html = await fetchText(embedUrl, { headers: { 'User-Agent': EGYAFLAM_UA, 'Referer': embedUrl } });
+    const unpacked = deanEdwardsUnpack(String(html));
+    const src = unpacked || String(html);
+    const m = src.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+    if (!m) throw new Error('لم يتم العثور على رابط m3u8 في vidspeed.');
+    return m[0].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+}
+
+async function egyaflamEpisodeLinks(episodeUrl) {
+    const html = await fetchText(episodeUrl, { headers: { 'User-Agent': EGYAFLAM_UA } });
+    const post = (String(html).match(/data-post=["'](\d+)["']/) || [])[1];
+    if (!post) throw new Error('لم يتم العثور على رقم المنشور.');
+    const nums = [...new Set([...String(html).matchAll(/data-nume=["'](\d+)["']/g)].map(m => m[1]))].slice(0, 7);
+    for (const nume of nums) {
+        try {
+            const ajax = await fetchTextPost(`${EGYAFLAM_BASE}/wp-admin/admin-ajax.php`,
+                { action: 'doo_player_ajax', post, nume, type: 'movie' },
+                { headers: { 'User-Agent': EGYAFLAM_UA, 'Referer': episodeUrl } });
+            // axios بيفك JSON تلقائياً أحياناً فيرجّع كائناً جاهزاً لا نصاً
+            const parsed = (ajax && typeof ajax === 'object') ? ajax : JSON.parse(String(ajax));
+            const embed = parsed.embed_url;
+            if (!embed || !/vidspeed/i.test(embed)) continue;
+            const m3u8 = await extractVidspeedM3u8(embed);
+            return [{ url: m3u8, label: 'EgyAflam — HLS (vidspeed)', referer: embed }];
+        } catch (_) {}
+    }
+    throw new Error('لا توجد سيرفرات شغالة لهذه الحلقة.');
 }
 
 
@@ -2602,7 +2892,7 @@ async function violaEpisodeLinks(vid) {
                 for (const r of await violaResolveVk(s.link)) out.push({ ...r, referer: 'https://hq.vio-la.com/' });
             } else if (/71stream/i.test(s.link)) {
                 for (const r of await violaScrape('https://mawdhou3.com/scrapefinal/71stream.php?api=', s.link)) out.push({ ...r, referer: 'https://hq.vio-la.com/' });
-            } else if (/ult4vid/i.test(s.link)) {
+            } else if (/ultra?4vid/i.test(s.link)) {
                 for (const r of await violaScrape('https://mawdhou3.com/scrapefinal/ult4vid.php?api=', s.link)) out.push({ ...r, referer: 'https://hq.vio-la.com/' });
             } else {
                 // محاولة أخيرة: mp4/m3u8 مباشر في صفحة الـ embed
@@ -2734,6 +3024,8 @@ async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
     }
     if (source === 'viola') return { links: await violaEpisodeLinks(ep.id) };
     if (source === 'egywatch') return { links: await egywatchEpisodeLinks(ep) };
+    if (source === 'dramaworld') return { links: await dramaWorldEpisodeLinks(ep) };
+    if (source === 'lodynet') return { links: await lodynetEpisodeLinks(ep.id) };
     return { links: [] };
 }
 
@@ -3642,7 +3934,7 @@ async function startXeonBotInc() {
                                 let outPath = path.join(tmpDir, `vid_${randomBytes(4).toString('hex')}.mp4`);
                                 try {
                                     await downloadVideoSmart(link.url, outPath, {
-                                        'User-Agent': 'Mozilla/5.0',
+                                        'User-Agent': WEB_UA,
                                         'Referer': item.referer || cached.referer || 'https://akwam.ss/',
                                         ...(cached.headers || {})
                                     });
@@ -3692,7 +3984,7 @@ async function startXeonBotInc() {
                             );
 
                             await downloadVideoSmart(finalUrl, outPath, {
-                                'User-Agent': 'Mozilla/5.0',
+                                'User-Agent': WEB_UA,
                                 'Referer': cached.referer || 'https://akwam.ss/',
                                 ...(cached.headers || {})
                             });
@@ -4231,6 +4523,35 @@ async function startXeonBotInc() {
                                 return;
                             }
 
+                            // EgyAflam → نتائج البحث حلقات منفردة، الجودات مباشرة (مثل ok.ru)
+                            if (selected.source === 'egyaflam') {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `⏳ جاري استخراج الجودات لـ\n*${selected.title}*...`
+                                }, { quoted: mek });
+                                try {
+                                    const links = await egyaflamEpisodeLinks(selected.id);
+                                    if (!links.length) throw new Error('لا توجد روابط تحميل متاحة.');
+                                    let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${selected.title}\n\n`;
+                                    links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
+                                    qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة.`;
+                                    const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                    qualityCache.set(sentQ.key.id, {
+                                        links: links.map(r => r.url),
+                                        names: links.map(r => r.label),
+                                        title: selected.title,
+                                        referer: (links[0] && links[0].referer) || '',
+                                        headers: {},
+                                        timestamp: Date.now()
+                                    });
+                                    setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                                } catch (err) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `❌ ${err.message}`
+                                    }, { quoted: mek });
+                                }
+                                return;
+                            }
+
                             // CloudDay / AnimeRift → جلب الحلقات
                             await XeonBotInc.sendMessage(chatId, {
                                 text: `⏳ جاري جلب حلقات *${selected.title}*...`
@@ -4277,6 +4598,12 @@ async function startXeonBotInc() {
                                     episodes = await animercoEpisodes(selected.id);
                                 } else if (selected.source === 'hianime') {
                                     episodes = await hianimeEpisodes(selected.id);
+                                } else if (selected.source === 'arabanime') {
+                                    episodes = await arabanimeEpisodes(selected.id);
+                                } else if (selected.source === 'animezid') {
+                                    episodes = await animezidEpisodes(selected.id);
+                                } else if (selected.source === 'okanime') {
+                                    episodes = await okanimeEpisodes(selected.id);
                                 }
                                 if (!episodes.length) throw new Error('لا توجد حلقات.');
                                 let epText = `📺 *${selected.title}*\n🔢 عدد الحلقات: ${episodes.length}\n\n`;
@@ -4641,6 +4968,10 @@ async function startXeonBotInc() {
                                     else await direct();
                                 } else if (selected.source === 'egywatch') {
                                     await showEpisodes(await egywatchEpisodes(selected.id));
+                                } else if (selected.source === 'dramaworld') {
+                                    await showEpisodes(await dramaWorldEpisodes(selected.id));
+                                } else if (selected.source === 'lodynet') {
+                                    await showEpisodes(await lodynetEpisodes(selected.id));
                                 } else if (selected.source === 'okru') {
                                     await direct();
                                 } else {
@@ -6547,7 +6878,7 @@ async function startXeonBotInc() {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: locked
                                     ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
-                                    : `🔍 جاري البحث عن *${query}* في 11 مصدراً...`
+                                    : `🔍 جاري البحث عن *${query}* في 15 مصدراً...`
                             }, { quoted: mek });
 
                             const results = [];
@@ -6565,8 +6896,8 @@ async function startXeonBotInc() {
                                 const list = await animeSearchOne(animeLockedSource, query);
                                 addResults(locked.source, locked.cdSource, list, 10);
                             } else {
-                                // بحث متوازي في المصادر الأحد عشر — فشل مصدر لا يوقف الباقي
-                                const [cdDay, cdCloud, rift, witcher, shahiid, a4up, animedar, kartoney, animerco, hianime, okru] = await Promise.allSettled([
+                                // بحث متوازي في المصادر الخمسة عشر — فشل مصدر لا يوقف الباقي
+                                const [cdDay, cdCloud, rift, witcher, shahiid, a4up, animedar, kartoney, animerco, hianime, okru, arab, az, okan, egya] = await Promise.allSettled([
                                     cloudDaySearch(query, 'AnimeDay'),
                                     cloudDaySearch(query, 'CimaCloud'),
                                     riftSearch(query),
@@ -6577,7 +6908,11 @@ async function startXeonBotInc() {
                                     kartoneySearch(query),
                                     animercoSearch(query),
                                     hianimeSearch(query),
-                                    okruSearchAnime(query)
+                                    okruSearchAnime(query),
+                                    arabanimeSearch(query),
+                                    animezidSearch(query),
+                                    okanimeSearch(query),
+                                    egyaflamSearch(query)
                                 ]);
                                 if (cdDay.status === 'fulfilled') addResults('cloudday', 'AnimeDay', cdDay.value, 3);
                                 if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
@@ -6590,10 +6925,14 @@ async function startXeonBotInc() {
                                 if (animerco.status === 'fulfilled') addResults('animerco', null, animerco.value, 2);
                                 if (hianime.status === 'fulfilled') addResults('hianime', null, hianime.value, 2);
                                 if (okru.status === 'fulfilled') addResults('okru', null, okru.value.map(v => ({ id: v.id, title: v.title })), 2);
+                                if (arab.status === 'fulfilled') addResults('arabanime', null, arab.value, 2);
+                                if (az.status === 'fulfilled') addResults('animezid', null, az.value, 2);
+                                if (okan.status === 'fulfilled') addResults('okanime', null, okan.value, 2);
+                                if (egya.status === 'fulfilled') addResults('egyaflam', null, egya.value, 2);
                             }
-                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setanime <مصدر آخر>\`.` : 'لم يتم العثور على أي نتائج في المصادر الأحد عشر. جرّب اسماً مختلفاً.');
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setanime <مصدر آخر>\`.` : 'لم يتم العثور على أي نتائج في المصادر الخمسة عشر. جرّب اسماً مختلفاً.');
 
-                            const tagOf = s => s === 'cloudday' ? '☁️ CloudDay' : s === 'rift' ? '🌐 AnimeRift' : s === 'witcher' ? '🧙 AnimeWitcher' : s === 'shahiid' ? '🎬 شهيد' : s === 'anime4up' ? '📺 Anime4Up' : s === 'animedar' ? '🎞️ Animedar' : s === 'kartoney' ? '🧒 Kartoney' : s === 'animerco' ? '🎭 Animerco' : s === 'hianime' ? '🌍 HiAnime EN' : '📺 ok.ru';
+                            const tagOf = s => s === 'cloudday' ? '☁️ CloudDay' : s === 'rift' ? '🌐 AnimeRift' : s === 'witcher' ? '🧙 AnimeWitcher' : s === 'shahiid' ? '🎬 شهيد' : s === 'anime4up' ? '📺 Anime4Up' : s === 'animedar' ? '🎞️ Animedar' : s === 'kartoney' ? '🧒 Kartoney' : s === 'animerco' ? '🎭 Animerco' : s === 'hianime' ? '🌍 HiAnime EN' : s === 'arabanime' ? '🌸 ArabAnime' : s === 'animezid' ? '🌟 AnimeZid' : s === 'okanime' ? '🎬 OkAnime' : s === 'egyaflam' ? '🎞️ EgyAflam' : '📺 ok.ru';
                             let responseText = `🎌 *نتائج البحث (أنمي عربي):*\n\n`;
                             results.slice(0, 15).forEach((r, index) => {
                                 responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
@@ -6630,7 +6969,11 @@ async function startXeonBotInc() {
                                 { name: '🧒 Kartoney', fn: async () => { const r = await kartoneySearch('pokemon'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🎭 Animerco', fn: async () => { const r = await animercoSearch('naruto'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🌍 HiAnime EN', fn: async () => { const r = await hianimeSearch('naruto'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
-                                { name: '📺 ok.ru', fn: async () => { const r = await okruSearchAnime('ناروتو الحلقة 1'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                                { name: '📺 ok.ru', fn: async () => { const r = await okruSearchAnime('ناروتو الحلقة 1'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🌸 ArabAnime', fn: async () => { const r = await arabanimeSearch('naruto shippuuden'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🌟 AnimeZid', fn: async () => { const r = await animezidSearch('naruto'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎬 OkAnime', fn: async () => { const r = await okanimeSearch('naruto'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎞️ EgyAflam', fn: async () => { const r = await egyaflamSearch('naruto'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
                             ];
                             const settled = await Promise.allSettled(probes.map(async p => {
                                 const t = Date.now();
@@ -6783,6 +7126,229 @@ async function startXeonBotInc() {
                         return;
                     }
 
+// ============================================================
+// v108 — .kdrama: DramaWorld + Lodynet + قوائم المصادر
+// ============================================================
+
+// ── تثبيت مصدر واحد لـ .kdrama (عبر .setkdrama) ──
+let kdLockedSource = null; // null = البحث في كل المصادر
+const KD_SOURCE_LIST = ['akwam', 'meowtv', 'cloudday', 'dramaworld', 'lodynet', 'okru'];
+const KD_SOURCE_NAMES = {
+    akwam: { source: 'akwam', label: '📺 Akwam' },
+    meowtv: { source: 'meowtv', label: '🐱 MeowTv' },
+    cloudday: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
+    dramaworld: { source: 'dramaworld', label: '🎭 DramaWorld' },
+    lodynet: { source: 'lodynet', label: '🎬 Lodynet' },
+    okru: { source: 'okru', label: '📺 ok.ru' }
+};
+
+// بحث مصدر واحد بالاسم (نفس دوال البحث — بلا تكرار كود)
+async function kdSearchOne(name, query) {
+    const e = KD_SOURCE_NAMES[name];
+    if (!e) return [];
+    if (e.source === 'akwam') return await akwamSearch(query, 'series');
+    if (e.source === 'meowtv') return await meowSearch(query, 'series');
+    if (e.source === 'cloudday') return await cloudDaySearch(query, 'CimaCloud', '2');
+    if (e.source === 'dramaworld') return await dramaWorldSearch(query);
+    if (e.source === 'lodynet') return await lodynetSearch(query);
+    if (e.source === 'okru') return (await okruSearchRaw(query)).map(v => ({ id: v.id, title: v.title }));
+    return [];
+}
+
+// ---------- DramaWorld (API — مترجم، وبعض العناوين مدبلجة) ----------
+// تم التحقق: لعبة الحبار id 6410 (S1 9/S2 7/S3 6)، ح1 242,470,740 بايت، 3582.42 ثانية
+// ملحوظة: ستريمات 1vid/hanerix مشفّرة AES-128 — تُحمّل بـ ffmpeg المباشر (downloadVideoSmart)، لا بـ downloadHlsSegments
+const DRAMAWORLD_BASES = ['https://dwapp.arabypros.com/api', 'https://test.arabypros.com/api'];
+const DRAMAWORLD_KEY = '4F5A9C3D9A86FA54EACEDDD635185';
+const DRAMAWORLD_UUID = 'd506abfd-9fe2-4b71-b979-feff21bcad13';
+const DRAMAWORLD_UA = 'okhttp/4.12.0';
+
+async function dramaWorldGet(path) {
+    let lastErr;
+    for (const base of DRAMAWORLD_BASES) {
+        try {
+            const res = await axios.get(`${base}/${path}/${DRAMAWORLD_KEY}/${DRAMAWORLD_UUID}/`, {
+                headers: { 'User-Agent': DRAMAWORLD_UA }, timeout: 20000
+            });
+            return res.data;
+        } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('فشل الاتصال بـ DramaWorld.');
+}
+
+async function dramaWorldSearch(query) {
+    const data = await dramaWorldGet(`search/${encodeURIComponent(query)}/0`);
+    const posters = (data && data.posters) || [];
+    return posters
+        .filter(p => /serie/i.test(String(p.type || '')))
+        .map(p => {
+            const label = String(p.label || '');
+            const tag = /مدبلج|مترجم/.test(label) ? ` (${label})` : '';
+            return { id: String(p.id), title: p.title + tag, type: 'series' };
+        })
+        .slice(0, 5);
+}
+
+async function dramaWorldEpisodes(seriesId) {
+    const seasons = await dramaWorldGet(`season/by/serie/${seriesId}`);
+    if (!Array.isArray(seasons) || !seasons.length) throw new Error('لا توجد مواسم.');
+    const eps = [];
+    seasons.forEach((s, i) => {
+        const m = String(s.title || '').match(/(\d+)/);
+        const sNum = m ? parseInt(m[1], 10) : (seasons.length - i);
+        for (const e of (s.episodes || [])) {
+            eps.push({
+                id: String(e.id),
+                number: 0,
+                title: `الموسم ${sNum} — الحلقة ${e.title || ''}`.trim(),
+                season: sNum,
+                epNum: 0
+            });
+        }
+    });
+    // ترقيم الحلقات بالترتيب داخل كل موسم (عنوان الحلقة غالباً "الحلقة N")
+    const perSeason = {};
+    eps.forEach(e => {
+        const n = (String(e.title).match(/الحلقة\s*(\d+)/) || [])[1];
+        e.epNum = n ? parseInt(n, 10) : ((perSeason[e.season] = (perSeason[e.season] || 0) + 1));
+    });
+    eps.sort((a, b) => (a.season - b.season) || (a.epNum - b.epNum));
+    eps.forEach((e, i) => { e.number = i + 1; });
+    if (!eps.length) throw new Error('لا توجد حلقات.');
+    return eps;
+}
+
+async function dramaWorldEpisodeLinks(ep) {
+    const res = await axios.get(`${DRAMAWORLD_BASES[0]}/episode/source/by/${ep.id}/${DRAMAWORLD_KEY}/${DRAMAWORLD_UUID}/`, {
+        headers: { 'User-Agent': DRAMAWORLD_UA }, timeout: 20000, responseType: 'text'
+    });
+    const text = String(res.data || '');
+    const idx = text.indexOf('W3s');
+    if (idx < 0) throw new Error('لم يتم العثور على قائمة السيرفرات.');
+    let servers;
+    try { servers = JSON.parse(Buffer.from(text.slice(idx), 'base64').toString('utf-8')); }
+    catch (_) { throw new Error('فشل تحليل قائمة السيرفرات.'); }
+    if (!Array.isArray(servers) || !servers.length) throw new Error('لا توجد سيرفرات.');
+    const links = [];
+    // Uqload أولاً (المضمون) — ثم أي تضمين فيه mp4/m3u8 مباشر
+    const uq = servers.filter(s => /uqload/i.test(s.title || '') || /uqload/i.test(s.url || ''));
+    for (const s of uq) {
+        try {
+            const m3u8 = await extractUqloadM3u8(s.url);
+            const plRes = await axios.get(m3u8, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://uqload.com/' }, timeout: 20000, responseType: 'text' });
+            const variants = parseM3u8Variants(String(plRes.data || ''), m3u8);
+            if (variants.length) {
+                for (const v of variants) links.push({ url: v.url, label: `DramaWorld — ${v.label} (Uqload)`, referer: 'https://uqload.com/' });
+            } else {
+                links.push({ url: m3u8, label: 'DramaWorld — HLS (Uqload)', referer: 'https://uqload.com/' });
+            }
+        } catch (_) {}
+    }
+    if (links.length) return [...new Map(links.map(l => [l.label, l])).values()];
+    for (const s of servers) {
+        const url = s.url || '';
+        if (/\.mp4(\?|$)/i.test(url)) return [{ url, label: `DramaWorld — MP4 (${s.title || 'server'})`, referer: '' }];
+        if (/\.m3u8(\?|$)/i.test(url)) return [{ url, label: `DramaWorld — HLS (${s.title || 'server'})`, referer: '' }];
+    }
+    throw new Error('لا توجد سيرفرات شغالة لهذه الحلقة.');
+}
+
+// ---------- Lodynet (lodynet.top — مترجم + أقسام مدبلجة) ----------
+// تم التحقق: لعبة الحبار ح1 198,262,204 بايت، 3582.30 ثانية، 13 سيرفر
+const LODYNET_BASE = 'https://lodynet.top';
+const LODYNET_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function lodynetSearch(query) {
+    const res = await axios.get(`${LODYNET_BASE}/`, {
+        params: { s: query },
+        headers: { 'User-Agent': LODYNET_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const out = []; const seen = new Set();
+    // نتائج البحث: روابط نسبية category/... والعنوان في خاصية title (تسبق href في الوسم)
+    for (const m of html.matchAll(/<a[^>]*href="(category\/[^"]+)"[^>]*>/g)) {
+        const tag = m[0];
+        const t = (tag.match(/title="([^"]{3,160})"/) || [])[1];
+        if (!t) continue; // روابط القائمة بلا title تُتجاهل
+        const url = LODYNET_BASE + '/' + m[1];
+        if (seen.has(url)) continue;
+        seen.add(url);
+        const title = decodeHtmlEntities(t.replace(/\s+/g, ' ').trim());
+        if (!title) continue;
+        out.push({ id: url, title });
+    }
+    return out.slice(0, 5);
+}
+
+async function lodynetEpisodes(categoryUrl) {
+    const res = await axios.get(categoryUrl, {
+        headers: { 'User-Agent': LODYNET_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const eps = []; const seen = new Set();
+    const normNum = s2 => parseInt(String(s2).replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)), 10);
+    const add = (url, num) => {
+        if (!url || !num || seen.has(num)) return;
+        seen.add(num);
+        eps.push({ id: url, number: num, title: `الحلقة ${num}` });
+    };
+    // الطريقة الأساسية: بطاقات ItemNewly — الرقم من title أو من نص البطاقة
+    // (تغطي صيغتي الروابط: /slug-ep{N} و /slug-الموسم-الث-N)
+    for (const b of html.matchAll(/<div class="ItemNewly">([\s\S]{0,900}?)<\/a>/g)) {
+        const block = b[1];
+        const hrefAbs = (block.match(/href="(https?:\/\/lodynet\.top\/[^"]+)"/) || [])[1];
+        const hrefRel = (block.match(/href="(\/[^"]+)"/) || [])[1];
+        const href = hrefAbs || (hrefRel ? LODYNET_BASE + hrefRel : null);
+        const t = (block.match(/title="([^"]+)"/) || [])[1] || (block.match(/NewlyTitle">([^<]+)</) || [])[1] || '';
+        const n = (t.match(/الحلقة\s*([٠-٩0-9]+)/) || [])[1];
+        if (href && n) add(href, normNum(n));
+    }
+    // احتياطي: روابط /slug-ep{N} في الصفحة كلها
+    if (!eps.length) {
+        for (const m of html.matchAll(/<a[^>]*href="(?:https?:\/\/lodynet\.top)?\/([a-z0-9\-]+-ep(\d+))[^"]*"[^>]*>/g)) {
+            add(`${LODYNET_BASE}/${m[1]}`, parseInt(m[2], 10));
+        }
+    }
+    eps.sort((a, b) => a.number - b.number);
+    if (!eps.length) throw new Error('لا توجد حلقات.');
+    return eps;
+}
+
+async function lodynetEpisodeLinks(episodeUrl) {
+    const res = await axios.get(episodeUrl, {
+        headers: { 'User-Agent': LODYNET_UA }, timeout: 20000, responseType: 'text'
+    });
+    const html = String(res.data || '');
+    const servers = [];
+    for (const m of html.matchAll(/"Name"\s*:\s*"([^"]+)"\s*,\s*"Embed"\s*:\s*"([^"]+)"/g)) {
+        try {
+            const url = Buffer.from(m[2], 'base64').toString('utf-8').trim();
+            if (url) servers.push({ name: m[1], url });
+        } catch (_) {}
+    }
+    if (!servers.length) throw new Error('لم يتم العثور على سيرفرات.');
+    const links = [];
+    const uq = servers.filter(s => /uqload/i.test(s.name) || /uqload/i.test(s.url));
+    for (const s of uq) {
+        try {
+            const m3u8 = await extractUqloadM3u8(s.url);
+            const plRes = await axios.get(m3u8, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://uqload.com/' }, timeout: 20000, responseType: 'text' });
+            const variants = parseM3u8Variants(String(plRes.data || ''), m3u8);
+            if (variants.length) {
+                for (const v of variants) links.push({ url: v.url, label: `Lodynet — ${v.label} (Uqload)`, referer: 'https://uqload.com/' });
+            } else {
+                links.push({ url: m3u8, label: 'Lodynet — HLS (Uqload)', referer: 'https://uqload.com/' });
+            }
+        } catch (_) {}
+    }
+    if (links.length) return [...new Map(links.map(l => [l.label, l])).values()];
+    for (const s of servers) {
+        if (/\.mp4(\?|$)/i.test(s.url)) return [{ url: s.url, label: `Lodynet — MP4 (${s.name})`, referer: '' }];
+        if (/\.m3u8(\?|$)/i.test(s.url)) return [{ url: s.url, label: `Lodynet — HLS (${s.name})`, referer: '' }];
+    }
+    throw new Error('لا توجد سيرفرات شغالة لهذه الحلقة.');
+}
+
                     // ── أمر .setmv (تثبيت مصدر واحد لـ .movie / .series) ──
                     if (command === '.setmv') {
                         const name = query.toLowerCase().trim();
@@ -6917,6 +7483,136 @@ async function startXeonBotInc() {
                         }
                         return;
                     }
+
+
+                    // ── أمر .setkdrama (تثبيت مصدر واحد لـ .kdrama) ──
+                    if (command === '.setkdrama') {
+                        const name = query.toLowerCase().trim();
+                        const namesList = KD_SOURCE_LIST.join('، ');
+                        if (!name) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: kdLockedSource
+                                    ? `📌 المصدر المثبّت حالياً: *${KD_SOURCE_NAMES[kdLockedSource].label}*\n\n💡 للتبديل: \`.setkdrama <اسم المصدر>\`\nللرجوع لكل المصادر: \`.setkdrama all\`\n\nالمصادر المتاحة: ${namesList}`
+                                    : `📌 لا يوجد مصدر مثبّت — البحث في كل المصادر.\n\n💡 للتثبيت على مصدر واحد: \`.setkdrama <اسم المصدر>\`\n\nالمصادر المتاحة: ${namesList}`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        if (name === 'all' || name === 'off' || name === 'none' || name === 'الكل') {
+                            kdLockedSource = null;
+                            await XeonBotInc.sendMessage(chatId, { text: '✅ تم الرجوع للبحث في كل المصادر.' }, { quoted: mek });
+                            return;
+                        }
+                        if (!KD_SOURCE_NAMES[name]) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ مصدر غير معروف: *${name}*\n\nالمصادر المتاحة: ${namesList}` }, { quoted: mek });
+                            return;
+                        }
+                        kdLockedSource = name;
+                        await XeonBotInc.sendMessage(chatId, { text: `✅ تم تثبيت مصدر الدراما الكورية على: *${KD_SOURCE_NAMES[name].label}*\n\n🔍 أمر .kdrama سيبحث فيه فقط الآن. عند وقوعه، بدّله بأمر \`.setkdrama <مصدر آخر>\` أو ارجع للكل بـ \`.setkdrama all\`.` }, { quoted: mek });
+                        return;
+                    }
+
+                    // ── أمر .kdrama (دراما كورية مدبلجة/مترجمة — 6 مصادر) ──
+                    if (command === '.kdrama') {
+                        if (!query) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '❌ يرجى كتابة اسم المسلسل الكوري.\n💡 *مثال:* `.kdrama لعبة الحبار` أو `.kdrama squid game`'
+                            }, { quoted: mek });
+                            return;
+                        }
+                        try {
+                            const locked = kdLockedSource ? KD_SOURCE_NAMES[kdLockedSource] : null;
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: locked
+                                    ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
+                                    : `🔍 جاري البحث عن *${query}* في 6 مصادر...`
+                            }, { quoted: mek });
+
+                            const results = [];
+                            const seenTitles = new Set();
+                            const addResults = (source, cdSource, list, max) => {
+                                for (const it of (Array.isArray(list) ? list : []).slice(0, max)) {
+                                    const key = String(it.title || '').trim().toLowerCase();
+                                    if (!key || seenTitles.has(key)) continue;
+                                    seenTitles.add(key);
+                                    results.push({ source, cdSource, id: it.id, type: 'series', title: it.title });
+                                }
+                            };
+                            if (locked) {
+                                const list = await kdSearchOne(kdLockedSource, query);
+                                addResults(locked.source, locked.cdSource, list, 10);
+                            } else {
+                                const [akwam, meow, cdCloud, dw, lody, okru] = await Promise.allSettled([
+                                    akwamSearch(query, 'series'),
+                                    meowSearch(query, 'series'),
+                                    cloudDaySearch(query, 'CimaCloud', '2'),
+                                    dramaWorldSearch(query),
+                                    lodynetSearch(query),
+                                    okruSearchRaw(query)
+                                ]);
+                                if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 2);
+                                if (meow.status === 'fulfilled') addResults('meowtv', null, meow.value, 2);
+                                if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 2);
+                                if (dw.status === 'fulfilled') addResults('dramaworld', null, dw.value, 2);
+                                if (lody.status === 'fulfilled') addResults('lodynet', null, lody.value, 2);
+                                if (okru.status === 'fulfilled') addResults('okru', null, okru.value.map(v => ({ id: v.id, title: v.title })), 2);
+                            }
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setkdrama <مصدر آخر>\`.` : 'لم يتم العثور على أي نتائج في المصادر الستة. جرّب اسماً مختلفاً.');
+
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cloudday' ? '☁️ CloudDay' : s === 'dramaworld' ? '🎭 DramaWorld' : s === 'lodynet' ? '🎬 Lodynet' : '📺 ok.ru';
+                            let responseText = `🇰🇷 *نتائج البحث (دراما كورية):*\n\n`;
+                            results.slice(0, 15).forEach((r, index) => {
+                                responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
+                            });
+                            responseText += `\n💡 *طريقة الاختيار:*\nقم **بالرد (Reply)** على هذه الرسالة برقم المسلسل المطلوب.\n\n🍿 *مثال:* \`1\``;
+
+                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                            mvCache.set(sentMsg.key.id, {
+                                stage: 'search',
+                                results: results.slice(0, 15),
+                                timestamp: Date.now()
+                            });
+                            setTimeout(() => mvCache.delete(sentMsg.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .kdramaapi (فحص حالة مصادر الدراما الكورية) ──
+                    if (command === '.kdramaapi') {
+                        try {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '🔍 جاري فحص مصادر الدراما الكورية...'
+                            }, { quoted: mek });
+                            const probes = [
+                                { name: '📺 Akwam', fn: async () => { const r = await akwamSearch('الحبار', 'series'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🐱 MeowTv', fn: async () => { const r = await meowSearch('squid game', 'series'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '☁️ CloudDay (CimaCloud)', fn: async () => { const r = await cloudDaySearch('squid game', 'CimaCloud', '2'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎭 DramaWorld', fn: async () => { const r = await dramaWorldSearch('squid game'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎬 Lodynet', fn: async () => { const r = await lodynetSearch('squid game'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 ok.ru', fn: async () => { const r = await okruSearchRaw('squid game'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                            ];
+                            const settled = await Promise.allSettled(probes.map(async p => {
+                                const t = Date.now();
+                                const n = await p.fn();
+                                return { name: p.name, ms: Date.now() - t, n };
+                            }));
+                            let out = `📊 *حالة مصادر الدراما الكورية:*\n\n`;
+                            settled.forEach((s, i) => {
+                                if (s.status === 'fulfilled') {
+                                    out += `🟢 *${s.value.name}* — شغال (${s.value.ms}ms، ${s.value.n} نتيجة)\n`;
+                                } else {
+                                    out += `🔴 *${probes[i].name}* — متوقف (${String((s.reason && s.reason.message) || 'خطأ').slice(0, 80)})\n`;
+                                }
+                            });
+                            out += `\n🕐 ${new Date().toLocaleString('ar-EG', { timeZone: 'Africa/Cairo' })}`;
+                            await XeonBotInc.sendMessage(chatId, { text: out }, { quoted: mek });
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل الفحص:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
 
                     // ── أمر .manga (3asq.online) ──
                     if (command === '.manga') {
